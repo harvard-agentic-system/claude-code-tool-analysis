@@ -1,0 +1,13 @@
+# analysis output - never commit your own transcript data
+cc-toolstat-out/
+*.parquet
+*.csv.gz
+report.txt
+dashboard.html
+!examples/*.html
+
+# scratch
+shot*.png
+__pycache__/
+*.pyc
+.venv/
