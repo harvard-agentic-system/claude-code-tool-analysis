@@ -31,6 +31,7 @@ import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 __version__ = "1.0.0"
 
@@ -225,9 +226,8 @@ def category_of(name):
     return CATEGORY.get(name, "other")
 
 
-def parse_transcript(args):
-    """Worker: parse one transcript into (calls, urls, turns). Never raises."""
-    path, root = args
+def parse_transcript(path, root):
+    """Claude Code reader: one transcript -> (calls, urls, turns, events)."""
     try:
         rel = os.path.relpath(path, root)
     except ValueError:
@@ -258,6 +258,7 @@ def parse_transcript(args):
             kind = d.get("type")
             if kind in ("ai-title", "queue-operation"):
                 events.append({
+                    "agent": "claude",
                     "kind": "title" if kind == "ai-title" else "queue",
                     "session_id": d.get("sessionId"), "project": project,
                     "ts": d.get("timestamp"),
@@ -267,6 +268,7 @@ def parse_transcript(args):
             if d.get("subtype") == "compact_boundary":
                 cm = d.get("compactMetadata") or {}
                 events.append({
+                    "agent": "claude",
                     "kind": "compact", "session_id": d.get("sessionId"), "project": project,
                     "ts": d.get("timestamp"),
                     "value": "%s:%s" % (cm.get("trigger"), cm.get("preTokens") or 0),
@@ -288,8 +290,9 @@ def parse_transcript(args):
                                      if isinstance(b, dict) and b.get("type") == "text").strip()
                 chars = 0 if INJECTED.match(text) else len(text)
                 if chars:
-                    events.append({"kind": "prompt", "session_id": d.get("sessionId"),
-                                   "project": project, "ts": d.get("timestamp"), "value": chars})
+                    events.append({"agent": "claude", "kind": "prompt",
+                                   "session_id": d.get("sessionId"), "project": project,
+                                   "ts": d.get("timestamp"), "value": chars})
 
             if not isinstance(content, list):
                 continue
@@ -305,6 +308,7 @@ def parse_transcript(args):
                         u = msg.get("usage") or {}
                         trig, kind = _trigger(human_ts, machine_ts)
                         t = turns[rid] = {
+                            "agent": "claude", "latency_basis": "trigger_to_last_block",
                             "request_id": rid, "session_id": d.get("sessionId"),
                             "project": project, "transcript": rel,
                             "model": msg.get("model"), "ts": stamp,
@@ -371,6 +375,7 @@ def parse_transcript(args):
                     q = inp.get("query") or inp.get("pattern") or inp.get("prompt")
                     caller = b.get("caller")
                     calls.append({
+                        "agent": "claude", "duration_basis": "wall_clock",
                         "tool_use_id": b.get("id"),
                         "session_id": d.get("sessionId"),
                         "project": project,
@@ -410,6 +415,7 @@ def parse_transcript(args):
                     pending[b.get("id")] = len(calls) - 1
                     if name == "WebFetch" and isinstance(inp.get("url"), str):
                         urls.append({
+                            "agent": "claude",
                             "source": "WebFetch", "url": inp["url"], "title": None,
                             "query": inp.get("prompt") if isinstance(inp.get("prompt"), str) else None,
                             "project": project, "session_id": d.get("sessionId"),
@@ -455,6 +461,7 @@ def parse_transcript(args):
                             for it in items or []:
                                 if isinstance(it, dict) and it.get("url"):
                                     urls.append({
+                                        "agent": "claude",
                                         "source": "WebSearch", "url": it["url"],
                                         "title": it.get("title"), "query": tur.get("query"),
                                         "project": project, "session_id": d.get("sessionId"),
@@ -490,37 +497,411 @@ def _trigger(human_ts, machine_ts):
     return None, None
 
 
+# ------------------------------------------------------------ codex reader ---
+# Codex writes one "rollout" JSONL per session under
+# ~/.codex/sessions/YYYY/MM/DD/. Records are {timestamp, ordinal, type, payload}.
+# Tool work shows up as `item_completed` payloads carrying an item with its own
+# started_at_ms / completed_at_ms, and CommandExecution items also carry an
+# explicit `duration` and `exit_code` - better ground truth than a timestamp gap.
+
+CODEX_TOOL_ITEMS = {
+    "CommandExecution": ("exec", "shell"),
+    "CollabAgentToolCall": ("collab_agent", "agent"),
+    "DynamicToolCall": ("dynamic_tool", "other"),
+    "Extension": ("extension", "other"),
+    "SubAgentActivity": ("subagent", "agent"),
+    "WebSearch": ("web_search", "web"),
+    "FileChange": ("file_change", "file_write"),
+}
+
+
+def _codex_cmd(item):
+    cmd = item.get("command")
+    if isinstance(cmd, list):
+        # `["/bin/bash", "-lc", "<script>"]` - the script is what actually ran.
+        if len(cmd) >= 3 and cmd[0].endswith(("bash", "sh", "zsh")) and cmd[1].startswith("-"):
+            return cmd[2]
+        return " ".join(str(c) for c in cmd)
+    return cmd if isinstance(cmd, str) else None
+
+
+def parse_codex(path, root):
+    calls, urls, turns, events = [], [], [], []
+    session_id = os.path.splitext(os.path.basename(path))[0]
+    project = cwd = None
+    model = None
+    pending_model_ms = 0        # model-item time accrued since the last token_count
+    cur_turn = None
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return [], [], [], []
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line[0] != "{":
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            p = d.get("payload")
+            if not isinstance(p, dict):
+                continue
+            stamp = d.get("timestamp")
+            ptype = p.get("type") or d.get("type")
+            # token_count carries no turn_id, so remember the turn in flight.
+            if p.get("turn_id"):
+                cur_turn = p["turn_id"]
+
+            if d.get("type") == "session_meta":
+                session_id = p.get("session_id") or p.get("id") or session_id
+                cwd = p.get("cwd") or cwd
+                project = cwd or "(unknown)"
+                continue
+            if d.get("type") == "turn_context":
+                cwd = p.get("cwd") or cwd
+                project = project or cwd
+                model = p.get("model") or model
+                continue
+            if d.get("type") == "world_state":
+                cm = ((p.get("state") or {}).get("collaboration_mode") or {})
+                model = cm.get("model") or model
+                continue
+
+            if ptype == "token_count":
+                info = p.get("info") or {}
+                u = info.get("last_token_usage") or {}
+                if not u:
+                    continue
+                turns.append({
+                    "agent": "codex", "latency_basis": "model_item_span",
+                    "request_id": "%s:%d" % (os.path.basename(path), len(turns)),
+                    "session_id": session_id, "project": project or "(unknown)",
+                    "transcript": os.path.relpath(path, root), "model": model,
+                    "ts": stamp, "trigger_kind": "tool_result",
+                    "stop_reason": None, "service_tier": None, "speed": None,
+                    "input_tokens": u.get("input_tokens") or 0,
+                    "output_tokens": u.get("output_tokens") or 0,
+                    "cache_read_tokens": u.get("cached_input_tokens") or 0,
+                    "cache_creation_tokens": u.get("cache_write_input_tokens") or 0,
+                    "thinking_tokens": u.get("reasoning_output_tokens") or 0,
+                    "cache_5m_tokens": 0, "cache_1h_tokens": 0,
+                    "is_sidechain": False, "entrypoint": "codex",
+                    "blocks": 1, "tool_uses": 0, "thinking": bool(u.get("reasoning_output_tokens")),
+                    "latency_ms": pending_model_ms or None,
+                    "ttfb_ms": None, "decode_ms": None,
+                    "output_tps": None, "cache_hit_ratio": None,
+                    "idle": pending_model_ms > IDLE_CUTOFF_MS,
+                })
+                pending_model_ms = 0
+                continue
+
+            if ptype != "item_completed":
+                continue
+            item = p.get("item") or {}
+            itype = item.get("type")
+            a, z = p.get("started_at_ms"), p.get("completed_at_ms")
+            dur = (z - a) if (a and z and z >= a) else None
+
+            if itype in ("Reasoning", "AgentMessage"):
+                # Reasoning and AgentMessage are the model generating. Their time
+                # belongs to the next token_count, which is that model call's usage.
+                if dur is not None:
+                    pending_model_ms += dur
+                continue
+            if itype == "ContextCompaction":
+                events.append({"agent": "codex", "kind": "compact", "session_id": session_id,
+                               "project": project or "(unknown)", "ts": stamp,
+                               "value": "auto:%s" % (item.get("pre_tokens") or 0)})
+                continue
+            if itype == "UserMessage":
+                txt = item.get("text") or item.get("content") or ""
+                if isinstance(txt, list):
+                    txt = " ".join(str(x.get("text", "")) for x in txt if isinstance(x, dict))
+                txt = str(txt).strip()
+                if txt and not INJECTED.match(txt):
+                    events.append({"agent": "codex", "kind": "prompt", "session_id": session_id,
+                                   "project": project or "(unknown)", "ts": stamp,
+                                   "value": len(txt)})
+                continue
+
+            name, cat = CODEX_TOOL_ITEMS.get(itype, (itype or "unknown", "other"))
+            cmd = _codex_cmd(item)
+            # The item's own duration is finer-grained than the ms timestamps.
+            dd = item.get("duration")
+            if isinstance(dd, dict):
+                secs, nanos = dd.get("secs") or 0, dd.get("nanos") or 0
+                if secs or nanos:
+                    dur = int(secs * 1000 + nanos / 1e6)
+            out = item.get("aggregated_output") or item.get("stdout") or ""
+            exit_code = item.get("exit_code")
+            failed = item.get("status") == "failed" or bool(exit_code)
+            body = str(item.get("stderr") or "")[:600] or ("Exit code %s" % exit_code if exit_code else "")
+            primary, bins, heredoc = parse_bash(cmd) if cmd else (None, [], False)
+            kind = classify_error(body) if failed else None
+            calls.append({
+                "agent": "codex",
+                "duration_basis": "dispatch_only" if itype == "CommandExecution" else "wall_clock",
+                "tool_use_id": item.get("id"),
+                "session_id": session_id, "project": project or "(unknown)",
+                "transcript": os.path.relpath(path, root), "cwd": cwd,
+                "git_branch": None, "entrypoint": "codex", "cc_version": None,
+                "model": model, "ts": stamp, "ts_ms": ts_ms(stamp),
+                "tool_name": name, "tool_category": cat,
+                "mcp_server": None, "mcp_tool": None,
+                "is_sidechain": itype == "SubAgentActivity", "from_subagent_file": False,
+                "caller": None,
+                "input_bytes": len(json.dumps(item.get("command") or item.get("input") or "",
+                                              default=str)),
+                "bash_command": cmd[:4000] if cmd else None,
+                "bash_primary": primary, "bash_bins": bins, "bash_heredoc": heredoc,
+                "file_path": None, "file_ext": None, "url": None, "query": None,
+                "subagent_type": None, "skill_name": None,
+                "lines_added": None, "lines_removed": None, "resolved_model": None,
+                "is_error": bool(failed),
+                "error_kind": kind, "error_group": ERROR_GROUP.get(kind, "other") if kind else None,
+                "error_text": body or None,
+                "output_bytes": len(str(out)), "duration_ms": dur,
+                "result_ts": stamp,
+            })
+    for t in turns:
+        span = t.get("latency_ms")
+        if span and not t["idle"]:
+            t["output_tps"] = round(t["output_tokens"] / (span / 1000.0), 2)
+        cached, fresh = t["cache_read_tokens"], t["cache_creation_tokens"] + t["input_tokens"]
+        t["cache_hit_ratio"] = round(cached / (cached + fresh), 4) if (cached + fresh) else None
+    return calls, urls, turns, events
+
+
+# ------------------------------------------------------------- grok reader ---
+# Grok stores JSON-RPC session updates at
+# ~/.grok/sessions/<url-encoded-cwd>/<session-id>/updates.jsonl. A tool runs as a
+# `tool_call` followed by `tool_call_update`s; the last one carries the status.
+# Record timestamps are unix SECONDS, so tool latency is only second-resolution.
+
+def parse_grok(path, root):
+    calls, urls, turns, events = [], [], [], []
+    parts = os.path.relpath(path, root).split(os.sep)
+    project = unquote(parts[0]) if parts else "(unknown)"
+    session_id = parts[1] if len(parts) > 1 else os.path.basename(os.path.dirname(path))
+    open_calls = {}
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return [], [], [], []
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line[0] != "{":
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            u = (d.get("params") or {}).get("update")
+            if not isinstance(u, dict):
+                continue
+            secs = d.get("timestamp")
+            stamp = (datetime.fromtimestamp(secs, timezone.utc).isoformat().replace("+00:00", "Z")
+                     if isinstance(secs, (int, float)) else None)
+            kind = u.get("sessionUpdate")
+            meta = (u.get("_meta") or {}).get("x.ai/tool") or {}
+
+            if kind == "tool_call":
+                cid = u.get("toolCallId")
+                name = meta.get("name") or meta.get("kind") or "unknown"
+                raw = u.get("rawInput") if isinstance(u.get("rawInput"), dict) else {}
+                cmd = raw.get("command") or raw.get("cmd")
+                primary, bins, heredoc = parse_bash(cmd) if isinstance(cmd, str) else (None, [], False)
+                fp = raw.get("file_path") or raw.get("path") or raw.get("target_file")
+                calls.append({
+                    "agent": "grok", "duration_basis": "wall_clock_1s",
+                    "tool_use_id": cid, "session_id": session_id,
+                    "project": project, "transcript": os.path.relpath(path, root),
+                    "cwd": project, "git_branch": None, "entrypoint": "grok",
+                    "cc_version": None, "model": None, "ts": stamp, "ts_ms": ts_ms(stamp),
+                    "tool_name": name,
+                    "tool_category": GROK_CATEGORY.get(name, GROK_KIND.get(meta.get("kind"), "other")),
+                    "mcp_server": meta.get("namespace") if meta.get("namespace") not in
+                                  (None, "grok_build") else None,
+                    "mcp_tool": None, "is_sidechain": False, "from_subagent_file": False,
+                    "caller": None,
+                    "input_bytes": len(json.dumps(raw, default=str)),
+                    "bash_command": cmd[:4000] if isinstance(cmd, str) else None,
+                    "bash_primary": primary, "bash_bins": bins, "bash_heredoc": heredoc,
+                    "file_path": fp if isinstance(fp, str) else None,
+                    "file_ext": (os.path.splitext(fp)[1].lower() if isinstance(fp, str) else None),
+                    "url": raw.get("url") if isinstance(raw.get("url"), str) else None,
+                    "query": raw.get("pattern") or raw.get("query")
+                             if isinstance(raw.get("pattern") or raw.get("query"), str) else None,
+                    "subagent_type": None, "skill_name": None,
+                    "lines_added": None, "lines_removed": None, "resolved_model": None,
+                    "is_error": None, "error_kind": None, "error_group": None,
+                    "error_text": None, "output_bytes": 0, "duration_ms": None,
+                    "result_ts": None,
+                })
+                open_calls[cid] = len(calls) - 1
+                if name == "web_fetch" and isinstance(raw.get("url"), str):
+                    urls.append({"agent": "grok", "source": "WebFetch", "url": raw["url"],
+                                 "title": None, "query": None, "project": project,
+                                 "session_id": session_id, "ts": stamp, "tool_use_id": cid})
+
+            elif kind == "tool_call_update":
+                idx = open_calls.get(u.get("toolCallId"))
+                if idx is None or u.get("status") in (None, "in_progress"):
+                    continue
+                row = calls[idx]
+                failed = u.get("status") == "failed"
+                body = json.dumps(u.get("rawOutput") or u.get("content") or "", default=str)
+                row["is_error"] = failed
+                if failed:
+                    ek = classify_error(body)
+                    row["error_kind"] = ek
+                    row["error_group"] = ERROR_GROUP.get(ek, "other")
+                    row["error_text"] = body[:600]
+                row["output_bytes"] = len(body)
+                row["result_ts"] = stamp
+                a, z = row["ts_ms"], ts_ms(stamp)
+                if a and z and z >= a:
+                    row["duration_ms"] = z - a
+
+            elif kind == "turn_completed":
+                us = u.get("usage") or {}
+                lat = us.get("apiDurationMs")
+                mu = us.get("modelUsage") or {}
+                model = next(iter(mu), None)
+                turns.append({
+                    "agent": "grok", "latency_basis": "api_duration_ms",
+                    "request_id": u.get("prompt_id"), "session_id": session_id,
+                    "project": project, "transcript": os.path.relpath(path, root),
+                    "model": model, "ts": stamp, "trigger_kind": "tool_result",
+                    "stop_reason": u.get("stop_reason"), "service_tier": None, "speed": None,
+                    "input_tokens": us.get("inputTokens") or 0,
+                    "output_tokens": us.get("outputTokens") or 0,
+                    "cache_read_tokens": us.get("cachedReadTokens") or 0,
+                    "cache_creation_tokens": us.get("cacheCreationTokens") or 0,
+                    "thinking_tokens": us.get("reasoningTokens") or 0,
+                    "cache_5m_tokens": 0, "cache_1h_tokens": 0,
+                    "is_sidechain": False, "entrypoint": "grok",
+                    "blocks": us.get("modelCalls") or 1, "tool_uses": 0,
+                    "thinking": bool(us.get("reasoningTokens")),
+                    "latency_ms": lat, "ttfb_ms": None, "decode_ms": None,
+                    "idle": bool(lat and lat > IDLE_CUTOFF_MS),
+                    "output_tps": (round((us.get("outputTokens") or 0) / (lat / 1000.0), 2)
+                                   if lat and lat <= IDLE_CUTOFF_MS else None),
+                    "cache_hit_ratio": None,
+                })
+            elif kind == "user_message_chunk":
+                c = u.get("content") or {}
+                txt = str(c.get("text") or "").strip() if isinstance(c, dict) else ""
+                if txt and not INJECTED.match(txt):
+                    events.append({"agent": "grok", "kind": "prompt", "session_id": session_id,
+                                   "project": project, "ts": stamp, "value": len(txt)})
+    for t in turns:
+        cached, fresh = t["cache_read_tokens"], t["cache_creation_tokens"] + t["input_tokens"]
+        t["cache_hit_ratio"] = round(cached / (cached + fresh), 4) if (cached + fresh) else None
+    return calls, urls, turns, events
+
+
+GROK_CATEGORY = {
+    "run_terminal_command": "shell", "kill_command_or_subagent": "shell",
+    "get_command_or_subagent_output": "shell",
+    "read_file": "file_read", "list_dir": "search", "grep": "search", "search_tool": "search",
+    "write": "file_write", "search_replace": "file_write", "edit_file": "file_write",
+    "web_fetch": "web", "web_search": "web",
+    "todo_write": "planning", "workflow": "agent", "use_tool": "other",
+    "ask_user_question": "user_io",
+}
+GROK_KIND = {"search": "search", "read": "file_read", "edit": "file_write",
+             "execute": "shell", "fetch": "web", "think": "planning", "other": "other"}
+
+
 # --------------------------------------------------------------- discovery ---
 
-def data_dirs(explicit=None):
-    """Candidate Claude Code data directories, most specific first."""
-    if explicit:
-        return [os.path.abspath(os.path.expanduser(explicit))]
-    out = []
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env:
-        out += [os.path.expanduser(p.strip()) for p in env.split(",") if p.strip()]
-    out.append(os.path.expanduser("~/.claude"))
-    out.append(os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "claude"))
-    seen, uniq = set(), []
-    for p in out:
-        p = os.path.abspath(p)
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
+AGENTS = {
+    "claude": {
+        "label": "Claude Code",
+        "bases": ["$CLAUDE_CONFIG_DIR", "~/.claude", "$XDG_CONFIG_HOME/claude"],
+        "sub": "projects", "glob": "**/*.jsonl", "parse": "claude",
+    },
+    "codex": {
+        "label": "Codex",
+        "bases": ["$CODEX_HOME", "~/.codex"],
+        "sub": "sessions", "glob": "**/rollout-*.jsonl", "parse": "codex",
+    },
+    "grok": {
+        "label": "Grok",
+        "bases": ["$GROK_HOME", "~/.grok"],
+        "sub": "sessions", "glob": "**/updates.jsonl", "parse": "grok",
+    },
+}
 
 
-def find_transcripts(explicit=None):
-    """Return (project_root, [transcript paths])."""
-    for base in data_dirs(explicit):
-        root = base if os.path.basename(base) == "projects" else os.path.join(base, "projects")
-        if os.path.isdir(root):
-            files = glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
-            if files:
-                return root, sorted(files)
+def _expand(spec):
+    if spec.startswith("$"):
+        name, _, rest = spec[1:].partition("/")
+        val = os.environ.get(name)
+        if not val:
+            if name == "XDG_CONFIG_HOME":
+                val = os.path.expanduser("~/.config")
+            else:
+                return []
+        return [os.path.abspath(os.path.join(p.strip(), rest))
+                for p in val.split(",") if p.strip()]
+    return [os.path.abspath(os.path.expanduser(spec))]
+
+
+def discover(agent, explicit=None):
+    """Return (root, [transcript paths]) for one agent, or (None, [])."""
+    spec = AGENTS[agent]
+    bases = [os.path.abspath(os.path.expanduser(explicit))] if explicit else []
+    if not bases:
+        for b in spec["bases"]:
+            bases.extend(_expand(b))
+    seen = set()
+    for base in bases:
+        if base in seen:
+            continue
+        seen.add(base)
+        root = base if os.path.basename(base) == spec["sub"] else os.path.join(base, spec["sub"])
+        if not os.path.isdir(root):
+            continue
+        files = sorted(glob.glob(os.path.join(root, spec["glob"]), recursive=True))
+        if files:
+            return root, files
     return None, []
+
+
+def discover_all(wanted=None, explicit=None):
+    """[(agent, root, files)] for every agent that has data on this machine."""
+    out = []
+    for agent in AGENTS:
+        if wanted and agent not in wanted:
+            continue
+        root, files = discover(agent, explicit if wanted == [agent] else None)
+        if files:
+            out.append((agent, root, files))
+    return out
+
+
+PARSERS = {}
+
+
+def parse_one(args):
+    """Pool worker: dispatch one transcript to its agent's reader.
+
+    A failure returns empty tables plus one diagnostic event, so a bad file
+    degrades to a reported gap rather than a silent one.
+    """
+    agent, path, root = args
+    try:
+        return PARSERS[agent](path, root)
+    except Exception as exc:
+        return [], [], [], [{"agent": agent, "kind": "parse_error", "session_id": None,
+                             "project": None, "ts": None,
+                             "value": "%s: %s: %s" % (os.path.basename(path),
+                                                      type(exc).__name__, exc)}]
 
 
 WORKTREE = re.compile(r"-{1,2}claude-worktrees-")
@@ -627,6 +1008,24 @@ LAT_EDGES = [0, 5, 10, 15, 25, 40, 60, 100, 150, 250, 400, 600, 1000, 1500, 2500
 # mean the session was paused, interrupted or resumed, and the wall clock kept
 # running. Such turns are flagged and kept out of latency statistics.
 IDLE_CUTOFF_MS = 600_000
+
+# What a tool's duration_ms actually measures, per agent. Only WALL bases belong
+# in a latency percentile; the rest are kept in the table but excluded from stats.
+DURATION_BASIS = {
+    "wall_clock":     "request issued -> result recorded",
+    "wall_clock_1s":  "same, but transcript timestamps are whole seconds",
+    "dispatch_only":  "command dispatch into a persistent shell, not its runtime",
+}
+WALL_BASES = ("wall_clock", "wall_clock_1s")
+
+# What a model turn's latency_ms measures, per agent. These are NOT interchangeable:
+# only Claude's includes queue and prefill, so a cross-agent p50 comparison is
+# apples to oranges unless the basis is stated.
+TURN_BASIS = {
+    "trigger_to_last_block": "triggering result -> last block (queue + prefill + decode)",
+    "model_item_span":       "generation items only (no queue or prefill)",
+    "api_duration_ms":       "API duration reported by the agent itself",
+}
 
 # Log-ish ladders for the two token/size histograms the dashboard filters on.
 THINK_EDGES = [0, 1, 50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000]
@@ -751,10 +1150,21 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     dates = sorted({r["date"] for r in live})
     di = {v: i for i, v in enumerate(dates)}
 
-    proj_n = Counter(r["project"] for r in live)
+    agents = sorted({r["agent"] for r in live},
+                    key=lambda a: -sum(1 for r in live if r["agent"] == a))
+    ai = {a: i for i, a in enumerate(agents)}
+
+    # Projects are keyed per agent: two agents can name the same cwd, and
+    # merging them would silently blend corpora.
+    proj_n = Counter((r["agent"], r["project"]) for r in live)
     projects = [p for p, _ in proj_n.most_common()]
     pi = {v: i for i, v in enumerate(projects)}
-    labels = shorten_projects(projects)
+    labels = {}
+    for ag in agents:                      # shorten within each agent's own tree
+        lm = shorten_projects([p for a, p in projects if a == ag])
+        for key in projects:
+            if key[0] == ag:
+                labels[key] = lm.get(key[1], key[1])
 
     tool_n = Counter(r["tool_name"] for r in live)
     tools = [t for t, _ in tool_n.most_common()]
@@ -769,7 +1179,7 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
 
     bin_calls = Counter()
     for r in live:
-        if r["tool_name"] == "Bash":
+        if r["tool_category"] == "shell":
             for b in r["bash_bins"] or []:
                 bin_calls[b] += 1
     bins = topn(bin_calls, 36)
@@ -790,7 +1200,7 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     sessions = {}
     n_bash = n_heredoc = n_cmds = 0
     for r in live:
-        d, p, t = di[r["date"]], pi[r["project"]], ti[r["tool_name"]]
+        d, p, t = di[r["date"]], pi[(r["agent"], r["project"])], ti[r["tool_name"]]
         cell = A[(d, p, t)]
         cell[0] += 1
         cell[1] += 1 if r["is_error"] else 0
@@ -803,7 +1213,7 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
             B[(d, p, ki[r["error_kind"]])] += 1
         if r["hour"] is not None:
             Cc[(d, p, r["hour"])] += 1
-        if r["tool_name"] == "Bash":
+        if r["tool_category"] == "shell":
             n_bash += 1
             n_heredoc += 1 if r["bash_heredoc"] else 0
             for b in r["bash_bins"] or []:
@@ -820,8 +1230,8 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
         J[(d, p, 1 if r["is_sidechain"] else 0)] += 1
 
     for u in urls:
-        if u.get("date") in di and u["project"] in pi:
-            E[(di[u["date"]], pi[u["project"]],
+        if u.get("date") in di and (u["agent"], u["project"]) in pi:
+            E[(di[u["date"]], pi[(u["agent"], u["project"])],
                dmi.get(u["domain"], dmi.get("· other", 0)),
                0 if u["source"] == "WebSearch" else 1)] += 1
 
@@ -829,11 +1239,11 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     # dashboard can recompute percentiles under any filter combination.
     L = Counter()
     for r in live:
-        if r["duration_ms"] is not None:
-            L[(di[r["date"]], pi[r["project"]], ti[r["tool_name"]],
+        if r["duration_ms"] is not None and r.get("duration_basis") in WALL_BASES:
+            L[(di[r["date"]], pi[(r["agent"], r["project"])], ti[r["tool_name"]],
                lat_bucket(r["duration_ms"]))] += 1
 
-    tlive = [t for t in turns if t.get("date") in di and t["project"] in pi]
+    tlive = [t for t in turns if t.get("date") in di and (t["agent"], t["project"]) in pi]
     model_n = Counter(t["model"] for t in tlive if t.get("model"))
     models = [m for m, _ in model_n.most_common()]
     mi = {v: i for i, v in enumerate(models)}
@@ -841,7 +1251,7 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     for t in tlive:
         if t.get("model") not in mi:
             continue
-        d, p, m = di[t["date"]], pi[t["project"]], mi[t["model"]]
+        d, p, m = di[t["date"]], pi[(t["agent"], t["project"])], mi[t["model"]]
         if (t.get("latency_ms") is not None and t.get("trigger_kind") == "tool_result"
                 and not t.get("idle")):
             M[(d, p, m, lat_bucket(t["latency_ms"]))] += 1
@@ -860,7 +1270,7 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     TH = Counter()
     for t in tlive:
         if t.get("model") in mi:
-            TH[(di[t["date"]], pi[t["project"]], mi[t["model"]],
+            TH[(di[t["date"]], pi[(t["agent"], t["project"])], mi[t["model"]],
                 bucket_of(THINK_EDGES, t.get("thinking_tokens") or 0))] += 1
 
     # Which tool follows which, and whether a failure recovers on the next call.
@@ -871,9 +1281,9 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     for rows in by_session.values():
         rows.sort(key=lambda r: r["ts_ms"] or 0)
         for a, b in zip(rows, rows[1:]):
-            P[(di[b["date"]], pi[b["project"]], ti[a["tool_name"]], ti[b["tool_name"]])] += 1
+            P[(di[b["date"]], pi[(b["agent"], b["project"])], ti[a["tool_name"]], ti[b["tool_name"]])] += 1
             if a["is_error"]:
-                R[(di[b["date"]], pi[b["project"]],
+                R[(di[b["date"]], pi[(b["agent"], b["project"])],
                    1 if a["tool_name"] == b["tool_name"] else 0,
                    0 if b["is_error"] else 1)] += 1
 
@@ -882,7 +1292,7 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     for r in live:
         if r.get("lines_added") is None and r.get("lines_removed") is None:
             continue
-        cell = CH[(di[r["date"]], pi[r["project"]],
+        cell = CH[(di[r["date"]], pi[(r["agent"], r["project"])],
                    xi.get(r["file_ext"] or "(none)", xi.get("· other", 0)))]
         cell[0] += r.get("lines_added") or 0
         cell[1] += r.get("lines_removed") or 0
@@ -894,7 +1304,7 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     Q, PRM, titles, compacts = Counter(), Counter(), {}, []
     for e in events:
         ed, _ = local_parts(e.get("ts")) if e.get("ts") else (None, None)
-        p = pi.get(e.get("project"))
+        p = pi.get((e.get("agent"), e.get("project")))
         if e["kind"] == "title" and e.get("session_id"):
             titles[e["session_id"]] = e["value"]
             continue
@@ -909,12 +1319,13 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
 
     q_agg = Counter()
     for u in urls:
-        if u["source"] == "WebSearch" and u.get("query") and u.get("date") in di:
-            q_agg[(str(u["query"])[:160], pi[u["project"]], di[u["date"]])] += 1
+        if (u["source"] == "WebSearch" and u.get("query") and u.get("date") in di
+                and (u["agent"], u["project"]) in pi):
+            q_agg[(str(u["query"])[:160], pi[(u["agent"], u["project"])], di[u["date"]])] += 1
     f_agg = Counter()
     for u in urls:
-        if u["source"] == "WebFetch" and u.get("url") and u["project"] in pi:
-            f_agg[(u["url"], pi[u["project"]])] += 1
+        if u["source"] == "WebFetch" and u.get("url") and (u["agent"], u["project"]) in pi:
+            f_agg[(u["url"], pi[(u["agent"], u["project"])])] += 1
 
     n_all = len(live)
     n_err = sum(1 for r in live if r["is_error"])
@@ -926,7 +1337,9 @@ def build_cube(calls, urls, turns, events, git_counter, redacted=False):
 
     cube = {
         "dates": dates,
-        "projects": [{"k": ("" if redacted else p), "n": labels[p]} for p in projects],
+        "projects": [{"k": ("" if redacted else p[1]), "n": labels[p], "a": ai[p[0]]}
+                     for p in projects],
+        "agents": [{"k": a, "n": AGENTS.get(a, {}).get("label", a)} for a in agents],
         "tools": [{"n": t, "c": tcat.get(t, "other")} for t in tools],
         "errKinds": [{"k": k, "g": ERROR_GROUP.get(k, "other")} for k in kinds],
         "bins": bins, "domains": domains, "exts": exts,
@@ -1031,8 +1444,8 @@ def build_copy(meta, n_err, n_notreal, n_side, n_all, top_cat, top_tool, grp_n, 
                      "underneath shares the same x axis rather than borrowing a second y scale."
                      % (idle, meta["calendarDays"])),
         "bash": ("Commands actually invoked, with heredoc bodies and quoted strings stripped so "
-                 "embedded scripts don’t masquerade as shell. A single Bash call runs %s commands "
-                 "on average, so shares sum past 100%%." % meta["cmdsPerBash"]),
+                 "embedded scripts don’t masquerade as shell. A single shell call runs %s "
+                 "commands on average, so shares sum past 100%%." % meta["cmdsPerBash"]),
         "tools": ("Bar length is call count on a linear scale — %s alone is %.0f%% of every call, "
                   "so the tail is read from its labels. The red tip is the portion that returned "
                   "an error." % (tool_name, pc(tool_n, n_all))),
@@ -1263,6 +1676,10 @@ tr:hover td{background:var(--rule-2)}
   </header>
 
   <div class="rail">
+    <div class="rail-row" id="agent-row" style="margin-bottom:9px" hidden>
+      <span class="rail-lbl">Agent</span>
+      <div class="chips" id="agent-chips"></div>
+    </div>
     <div class="rail-row" style="margin-bottom:9px">
       <span class="rail-lbl">Project</span>
       <div class="chips" id="chips"></div>
@@ -1325,7 +1742,7 @@ tr:hover td{background:var(--rule-2)}
 
   <div class="grid2">
     <section class="panel">
-      <div class="phead"><h2>Inside Bash</h2><span class="pmeta" id="bash-meta"></span></div>
+      <div class="phead"><h2>Inside the shell</h2><span class="pmeta" id="bash-meta"></span></div>
       <p class="pnote" id="note-bash"></p>
       <div class="bars" id="bash" style="--lw:78px;--vw:82px"></div>
     </section>
@@ -1501,7 +1918,7 @@ function agg(){
   const PRM=new Array(C.promptEdges.length).fill(0);
   for (const [d,p,b,cn] of (C.PRM||[])){ if(inF(d,p)) PRM[b]+=cn; }
   let bashCalls=0, bashErr=0;
-  C.tools.forEach((t,i)=>{ if(t.n==='Bash'){bashCalls=T[i].n; bashErr=T[i].e;} });
+  C.tools.forEach((t,i)=>{ if(t.c==='shell'){ bashCalls+=T[i].n; bashErr+=T[i].e; } });
   const notReal = GRPS.filter(g=>NOTREAL.has(g)).reduce((a,g)=>a+G[g],0);
   return {T,cat,daily,n,e,ob,ib,ds,dn,K,G,H,B,W,X,sessions:S.size,side,main,bashCalls,bashErr,
           notReal, LT,LM,LTby,LMby, turnN, turnSecs:turnLat/1000, turnOut,
@@ -1983,7 +2400,10 @@ function render(){
   setText('thesis',C.copy.thesis); setText('note-timeline',C.copy.timeline);
   setText('note-tools',C.copy.tools); setText('note-bash',C.copy.bash);
   const real=A.e-A.notReal;
-  document.getElementById('scope').innerHTML= (sel.size===nP?'all projects':sel.size+' of '+nP+' projects')+
+  const agOn=AG.length>1 ? [...new Set([...sel].map(i=>C.projects[i].a))]
+      .map(i=>AG[i].n).join(' + ')+' · ' : '';
+  document.getElementById('scope').innerHTML= agOn+
+    (sel.size===nP?'all projects':sel.size+' of '+nP+' projects')+
     ' · <b>'+C.dates[d0]+'</b> → <b>'+C.dates[d1]+'</b> · '+(d1-d0+1)+' days';
   document.getElementById('window').innerHTML=
     '<b>'+fmt(C.meta.totalCalls)+'</b> tool calls<br><b>'+fmt(C.meta.transcripts)+'</b> transcripts · <b>'+
@@ -2056,7 +2476,7 @@ function render(){
       '<div class="r"><i>share of Bash</i><b>'+p1(pct(r.n,A.bashCalls))+'</b></div>'+
       '<div class="r"><i>calls that errored</i><b>'+fmt(r.e)+' · '+p1(pct(r.e,r.n))+'</b></div>'
   })));
-  document.getElementById('bash-meta').textContent=fmt(A.bashCalls)+' Bash calls';
+  document.getElementById('bash-meta').textContent=fmt(A.bashCalls)+' shell calls';
 
   /* web */
   const wr=C.domains.map((d,i)=>({d,s:A.W[i][0],f:A.W[i][1]})).filter(r=>(r.s+r.f)&&r.d!=='· other')
@@ -2126,6 +2546,34 @@ if(!C.git.length){ const g=document.getElementById('tab-git'); if(g) g.remove();
 /* ---- controls ---- */
 const projTotals=C.projects.map(()=>0);
 for(const [d,p,t,n] of C.A) projTotals[p]+=n;
+/* agent chips select every project belonging to that agent */
+const AG=C.agents||[];
+if(AG.length>1){
+  const row=document.getElementById('agent-row'); row.hidden=false;
+  const projOf=a=>C.projects.map((p,i)=>[p,i]).filter(([p])=>p.a===a).map(([,i])=>i);
+  document.getElementById('agent-chips').innerHTML=AG.map((a,i)=>{
+    const n=projOf(i).length;
+    return '<button class="chip" data-ag="'+i+'" aria-pressed="true">'+esc(a.n)+
+      '<span class="cn">'+n+'</span></button>';}).join('');
+  document.getElementById('agent-chips').addEventListener('click',e=>{
+    const b=e.target.closest('[data-ag]'); if(!b) return;
+    const i=+b.dataset.ag, mine=projOf(i);
+    const allOn=AG.every((_,j)=>projOf(j).every(p=>sel.has(p)));
+    if(allOn) sel=new Set(mine);
+    else if(mine.every(p=>sel.has(p))){ mine.forEach(p=>sel.delete(p));
+      if(!sel.size) sel=new Set(C.projects.map((_,j)=>j)); }
+    else mine.forEach(p=>sel.add(p));
+    syncAgents(); drawChips(); render();
+  });
+}
+function syncAgents(){
+  if(AG.length<2) return;
+  const projOf=a=>C.projects.map((p,i)=>[p,i]).filter(([p])=>p.a===a).map(([,i])=>i);
+  document.querySelectorAll('[data-ag]').forEach(b=>{
+    const mine=projOf(+b.dataset.ag);
+    b.setAttribute('aria-pressed', mine.some(p=>sel.has(p))?'true':'false');
+  });
+}
 const SHOWN=10; let chipsOpen=false;
 function chipHTML(i){const p=C.projects[i];
   return '<button class="chip" data-p="'+i+'" aria-pressed="true" title="'+esc(p.k)+'">'+esc(p.n)+
@@ -2134,7 +2582,7 @@ function drawChips(){
   const n=chipsOpen?nP:Math.min(SHOWN,nP);
   let h=C.projects.slice(0,n).map((_,i)=>chipHTML(i)).join('');
   if(nP>SHOWN) h+='<button class="btn" id="more">'+(chipsOpen?'fewer':'+'+(nP-SHOWN)+' smaller')+'</button>';
-  document.getElementById('chips').innerHTML=h; syncChips();
+  document.getElementById('chips').innerHTML=h; syncChips(); syncAgents();
 }
 drawChips();
 document.getElementById('chips').addEventListener('click',e=>{
@@ -2234,6 +2682,31 @@ payload           : {bi} in / {bo} out
     def section(title):
         o.append("\n" + "=" * 78 + "\n" + title + "\n" + "=" * 78)
 
+    agents = Counter(r["agent"] for r in live)
+    if len(agents) > 1:
+        section("AGENTS")
+        rows = []
+        for ag, n in agents.most_common():
+            sub = [r for r in live if r["agent"] == ag]
+            tu = [t for t in turns if t["agent"] == ag]
+            wall = [r["duration_ms"] for r in sub
+                    if r["duration_ms"] is not None and r.get("duration_basis") in WALL_BASES]
+            lat = sorted(t["latency_ms"] for t in tu
+                         if t.get("latency_ms") is not None and not t.get("idle"))
+            rows.append([
+                AGENTS.get(ag, {}).get("label", ag), fmt_int(n),
+                fmt_int(len({r["session_id"] for r in sub})),
+                fmt_int(len({r["tool_name"] for r in sub})),
+                "%.1f%%" % (100.0 * sum(1 for r in sub if r["is_error"]) / len(sub)),
+                ms(pctl(sorted(wall), .5)) if wall else "—",
+                ms(pctl(lat, .5)) if lat else "—",
+                fmt_int(sum(t["output_tokens"] for t in tu)),
+            ])
+        o.append(_table(["agent", "calls", "sessions", "tools", "err%",
+                         "p50 tool", "p50 turn", "output tok"], rows))
+        o.append("  Clocks differ by agent - see the basis table under LATENCY before comparing\n"
+                 "  the p50 columns across rows.\n")
+
     section("TOOL CATEGORY")
     cat = defaultdict(lambda: [0, 0, set()])
     for r in live:
@@ -2279,7 +2752,7 @@ payload           : {bi} in / {bo} out
                                key=lambda r: -float(r[3][:-1]))))
         bb = defaultdict(lambda: [0, 0])
         for r in live:
-            if r["tool_name"] == "Bash":
+            if r["tool_category"] == "shell":
                 for b in r["bash_bins"] or []:
                     bb[b][0] += 1
                     bb[b][1] += 1 if r["is_error"] else 0
@@ -2287,7 +2760,7 @@ payload           : {bi} in / {bo} out
                        for b, v in bb.items() if v[0] >= 20 and v[1]],
                       key=lambda r: -float(r[3][:-1]))[:12]
         if rows:
-            o.append("\ncommands present in the most failing Bash calls (>=20 calls)\n")
+            o.append("\ncommands present in the most failing shell calls (>=20 calls)\n")
             o.append(_table(["command", "calls using", "of which errored", "rate"], rows))
     else:
         o.append("  no errors recorded\n")
@@ -2301,9 +2774,17 @@ payload           : {bi} in / {bo} out
                   inferences the harness started on its own. Turns triggered by a
                   typed prompt are excluded: that gap contains your typing.
 """)
+    bases = Counter(r.get("duration_basis") for r in live if r["duration_ms"] is not None)
+    if len(bases) > 1 or any(b not in WALL_BASES for b in bases):
+        o.append("  what duration_ms measures in this corpus\n")
+        o.append(_table(["basis", "calls", "meaning", "in stats"],
+                        [[b, fmt_int(n), DURATION_BASIS.get(b, "?"),
+                          "yes" if b in WALL_BASES else "NO"]
+                         for b, n in bases.most_common()], aligns=["<", ">", "<", "<"]))
+        o.append("")
     tool_lat = defaultdict(list)
     for r in live:
-        if r["duration_ms"] is not None:
+        if r["duration_ms"] is not None and r.get("duration_basis") in WALL_BASES:
             tool_lat[r["tool_name"]].append(r["duration_ms"])
     allv = sorted(v for vals in tool_lat.values() for v in vals)
     if allv:
@@ -2323,7 +2804,7 @@ payload           : {bi} in / {bo} out
 
         cat_lat = defaultdict(list)
         for r in live:
-            if r["duration_ms"] is not None:
+            if r["duration_ms"] is not None and r.get("duration_basis") in WALL_BASES:
                 cat_lat[r["tool_category"]].append(r["duration_ms"])
         o.append("\n  by category\n")
         o.append(_table(["category", "n", "p50", "p90", "p95"],
@@ -2334,7 +2815,8 @@ payload           : {bi} in / {bo} out
 
         bash_lat = defaultdict(list)
         for r in live:
-            if r["tool_name"] == "Bash" and r["duration_ms"] is not None:
+            if (r["tool_category"] == "shell" and r["duration_ms"] is not None
+                    and r.get("duration_basis") in WALL_BASES):
                 for b in r["bash_bins"] or []:
                     bash_lat[b].append(r["duration_ms"])
         rows = [[b, fmt_int(len(v)), ms(pctl(sorted(v), .5)), ms(pctl(sorted(v), .9)),
@@ -2342,11 +2824,12 @@ payload           : {bi} in / {bo} out
                 for b, v in sorted(bash_lat.items(), key=lambda x: -pctl(sorted(x[1]), .5))
                 if len(v) >= 20][:15]
         if rows:
-            o.append("\n  Bash calls containing each command, slowest median first (>=20 calls)\n")
+            o.append("\n  shell calls containing each command, slowest median first (>=20 calls)\n")
             o.append(_table(["command", "calls", "p50", "p90", "max"], rows))
 
         plabels = shorten_projects(sorted({r["project"] for r in live}))
-        slow = sorted((r for r in live if r["duration_ms"] is not None),
+        slow = sorted((r for r in live if r["duration_ms"] is not None
+                       and r.get("duration_basis") in WALL_BASES),
                       key=lambda r: -r["duration_ms"])[:10]
         o.append("\n  slowest individual calls\n")
         o.append(_table(["tool", "duration", "project", "when"],
@@ -2369,17 +2852,25 @@ payload           : {bi} in / {bo} out
         rows = []
         by_model = defaultdict(list)
         for t in timed:
-            by_model[t.get("model") or "?"].append(t)
-        for mdl, ts_ in sorted(by_model.items(), key=lambda x: -len(x[1])):
+            by_model[(t.get("agent") or "?", t.get("model") or "?")].append(t)
+        for (agn, mdl), ts_ in sorted(by_model.items(), key=lambda x: -len(x[1])):
             v = sorted(t["latency_ms"] for t in ts_)
             out = sum(t["output_tokens"] for t in ts_)
             secs = sum(t["latency_ms"] for t in ts_) / 1000.0
             med_out = pctl(sorted(t["output_tokens"] for t in ts_), .5)
-            rows.append([mdl, fmt_int(len(v)), ms(pctl(v, .5)), ms(pctl(v, .9)),
+            rows.append([mdl, agn, fmt_int(len(v)), ms(pctl(v, .5)), ms(pctl(v, .9)),
                          ms(pctl(v, .95)), ms(v[-1]), fmt_int(med_out or 0),
                          "%.1f" % (out / secs) if secs else "—"])
-        o.append(_table(["model", "turns", "p50", "p90", "p95", "max",
-                         "med out tok", "out tok/s"], rows))
+        o.append(_table(["model", "agent", "turns", "p50", "p90", "p95", "max",
+                         "med out tok", "out tok/s"], rows,
+                        aligns=["<", "<", ">", ">", ">", ">", ">", ">", ">"]))
+        tb = Counter(t.get("latency_basis") for t in timed)
+        if len(tb) > 1:
+            o.append("\n  turn latency is measured differently per agent - do NOT compare the\n"
+                     "  p50 column across agents without reading this\n")
+            o.append(_table(["basis", "turns", "meaning"],
+                            [[b, fmt_int(n), TURN_BASIS.get(b, "?")] for b, n in tb.most_common()],
+                            aligns=["<", ">", "<"]))
         o.append("  out tok/s is end to end (queue + prefill + decode), so a model used for "
                  "many small turns\n  reads slower than one used for long ones - read it "
                  "next to the median output size.\n")
@@ -2405,6 +2896,7 @@ payload           : {bi} in / {bo} out
         # machine, and idle turns are not inference at all.
         tool_ms = sum(r["duration_ms"] for r in live
                       if r["duration_ms"] is not None
+                      and r.get("duration_basis") in WALL_BASES
                       and r["tool_category"] != "user_io"
                       and r["duration_ms"] <= IDLE_CUTOFF_MS)
         human_ms = sum(r["duration_ms"] for r in live
@@ -2571,13 +3063,13 @@ payload           : {bi} in / {bo} out
     section("WORKLOAD")
     bc = Counter()
     for r in live:
-        if r["tool_name"] == "Bash":
+        if r["tool_category"] == "shell":
             for b in r["bash_bins"] or []:
                 bc[b] += 1
     if bc:
-        o.append("commands by share of Bash calls (%s calls, %s cmds each)\n"
+        o.append("commands by share of shell calls (%s calls, %s cmds each)\n"
                  % (fmt_int(m["bashCalls"]), m["cmdsPerBash"]))
-        o.append(_table(["command", "calls using", "% of bash"],
+        o.append(_table(["command", "calls using", "% of shell"],
                         [[k, fmt_int(v), p1(v, m["bashCalls"])] for k, v in bc.most_common(25)]))
     if git_counter:
         o.append("\ngit subcommands (%s invocations)\n" % fmt_int(sum(git_counter.values())))
@@ -2641,8 +3133,10 @@ def _bytes(b):
 
 # -------------------------------------------------------------------- main ---
 
+PARSERS.update({"claude": parse_transcript, "codex": parse_codex, "grok": parse_grok})
+
 CALL_COLUMNS = [
-    "tool_use_id", "session_id", "project", "transcript", "cwd", "git_branch",
+    "agent", "tool_use_id", "session_id", "project", "transcript", "cwd", "git_branch",
     "entrypoint", "cc_version", "model", "ts", "ts_ms", "date", "hour",
     "tool_name", "tool_category", "mcp_server", "mcp_tool",
     "is_sidechain", "from_subagent_file", "caller",
@@ -2650,12 +3144,12 @@ CALL_COLUMNS = [
     "bash_command", "bash_primary", "bash_bins", "bash_heredoc",
     "file_path", "file_ext", "url", "query", "subagent_type", "skill_name",
     "is_error", "error_kind", "error_group", "error_text",
-    "lines_added", "lines_removed", "resolved_model",
+    "lines_added", "lines_removed", "resolved_model", "duration_basis",
 ]
-URL_COLUMNS = ["source", "url", "domain", "title", "query", "project",
+URL_COLUMNS = ["agent", "source", "url", "domain", "title", "query", "project",
                "session_id", "ts", "date", "tool_use_id"]
 TURN_COLUMNS = [
-    "request_id", "session_id", "project", "transcript", "model", "ts", "date", "hour",
+    "agent", "latency_basis", "request_id", "session_id", "project", "transcript", "model", "ts", "date", "hour",
     "trigger_kind", "latency_ms", "ttfb_ms", "decode_ms", "output_tps",
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
     "cache_hit_ratio", "stop_reason", "service_tier", "speed",
@@ -2669,7 +3163,13 @@ def main(argv=None):
         prog="cc-toolstat",
         description="Audit your Claude Code tool usage from local session transcripts.",
         epilog="Reads local files only. Nothing is uploaded.")
-    ap.add_argument("--dir", help="Claude data dir (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
+    ap.add_argument("--agent", action="append", metavar="NAME",
+                    help="limit to one agent (%s); repeatable, default all detected"
+                         % ", ".join(AGENTS))
+    ap.add_argument("--dir", help="data dir for the selected agent "
+                                  "(default: each agent's own location)")
+    ap.add_argument("--list-agents", action="store_true",
+                    help="show which agents have transcripts here, then exit")
     ap.add_argument("--out", default="cc-toolstat-out", help="output directory")
     ap.add_argument("--since", metavar="YYYY-MM-DD", help="only calls on or after this local date")
     ap.add_argument("--until", metavar="YYYY-MM-DD", help="only calls on or before this local date")
@@ -2688,16 +3188,36 @@ def main(argv=None):
 
     say = (lambda *m: None) if a.quiet else (lambda *m: print(*m, file=sys.stderr))
 
-    root, files = find_transcripts(a.dir)
-    if not files:
-        tried = ", ".join(data_dirs(a.dir))
-        print("No Claude Code transcripts found. Looked in: %s\n"
-              "Point --dir at the directory that contains 'projects'." % tried, file=sys.stderr)
+    wanted = a.agent
+    if wanted:
+        bad = [w for w in wanted if w not in AGENTS]
+        if bad:
+            print("Unknown agent(s): %s. Known: %s" % (", ".join(bad), ", ".join(AGENTS)),
+                  file=sys.stderr)
+            return 2
+    found = discover_all(wanted, a.dir)
+
+    if a.list_agents:
+        for agent in AGENTS:
+            hit = next((f for f in found if f[0] == agent), None)
+            print("  %-8s %-14s %s" % (
+                agent, AGENTS[agent]["label"],
+                "%s transcripts in %s" % (fmt_int(len(hit[2])), hit[1]) if hit else "not found"))
+        return 0
+
+    if not found:
+        print("No agent transcripts found. Looked for: %s\n"
+              "Run with --list-agents to see where each is expected."
+              % ", ".join("%s (%s)" % (k, v["bases"][-1]) for k, v in AGENTS.items()),
+              file=sys.stderr)
         return 2
-    say("Reading %s transcripts from %s" % (fmt_int(len(files)), root))
+    for agent, root, files in found:
+        say("Reading %s %s transcripts from %s"
+            % (fmt_int(len(files)), AGENTS[agent]["label"], root))
 
     calls, urls, turns, events = [], [], [], []
-    payload = [(f, root) for f in files]
+    payload = [(agent, f, root) for agent, root, files in found for f in files]
+    files = payload
 
     def collect(results):
         for c, u, t, e in results:
@@ -2709,16 +3229,24 @@ def main(argv=None):
     if a.jobs > 1 and len(files) > 4:
         try:
             with ProcessPoolExecutor(max_workers=a.jobs) as ex:
-                collect(ex.map(parse_transcript, payload, chunksize=8))
+                collect(ex.map(parse_one, payload, chunksize=8))
         except Exception as e:                       # sandboxes without fork/sem support
             say("  parallel parse unavailable (%s); falling back to one process" % e)
             calls, urls, turns, events = [], [], [], []
-            collect(parse_transcript(i) for i in payload)
+            collect(parse_one(i) for i in payload)
     else:
-        collect(parse_transcript(i) for i in payload)
+        collect(parse_one(i) for i in payload)
 
     # A resumed or forked session replays earlier turns into a new transcript.
     # tool_use ids are unique per API call, so keep the first and drop the copies.
+    perr = [e for e in events if e.get("kind") == "parse_error"]
+    if perr:
+        say("  WARNING: %s of %s transcripts failed to parse"
+            % (fmt_int(len(perr)), fmt_int(len(payload))))
+        for e in perr[:3]:
+            say("    %s" % e["value"])
+        events = [e for e in events if e.get("kind") != "parse_error"]
+
     calls.sort(key=lambda r: r["ts_ms"] or 0)
     seen, deduped, dupes = set(), [], 0
     for r in calls:

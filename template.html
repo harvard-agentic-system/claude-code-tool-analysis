@@ -191,6 +191,10 @@ tr:hover td{background:var(--rule-2)}
   </header>
 
   <div class="rail">
+    <div class="rail-row" id="agent-row" style="margin-bottom:9px" hidden>
+      <span class="rail-lbl">Agent</span>
+      <div class="chips" id="agent-chips"></div>
+    </div>
     <div class="rail-row" style="margin-bottom:9px">
       <span class="rail-lbl">Project</span>
       <div class="chips" id="chips"></div>
@@ -253,7 +257,7 @@ tr:hover td{background:var(--rule-2)}
 
   <div class="grid2">
     <section class="panel">
-      <div class="phead"><h2>Inside Bash</h2><span class="pmeta" id="bash-meta"></span></div>
+      <div class="phead"><h2>Inside the shell</h2><span class="pmeta" id="bash-meta"></span></div>
       <p class="pnote" id="note-bash"></p>
       <div class="bars" id="bash" style="--lw:78px;--vw:82px"></div>
     </section>
@@ -429,7 +433,7 @@ function agg(){
   const PRM=new Array(C.promptEdges.length).fill(0);
   for (const [d,p,b,cn] of (C.PRM||[])){ if(inF(d,p)) PRM[b]+=cn; }
   let bashCalls=0, bashErr=0;
-  C.tools.forEach((t,i)=>{ if(t.n==='Bash'){bashCalls=T[i].n; bashErr=T[i].e;} });
+  C.tools.forEach((t,i)=>{ if(t.c==='shell'){ bashCalls+=T[i].n; bashErr+=T[i].e; } });
   const notReal = GRPS.filter(g=>NOTREAL.has(g)).reduce((a,g)=>a+G[g],0);
   return {T,cat,daily,n,e,ob,ib,ds,dn,K,G,H,B,W,X,sessions:S.size,side,main,bashCalls,bashErr,
           notReal, LT,LM,LTby,LMby, turnN, turnSecs:turnLat/1000, turnOut,
@@ -911,7 +915,10 @@ function render(){
   setText('thesis',C.copy.thesis); setText('note-timeline',C.copy.timeline);
   setText('note-tools',C.copy.tools); setText('note-bash',C.copy.bash);
   const real=A.e-A.notReal;
-  document.getElementById('scope').innerHTML= (sel.size===nP?'all projects':sel.size+' of '+nP+' projects')+
+  const agOn=AG.length>1 ? [...new Set([...sel].map(i=>C.projects[i].a))]
+      .map(i=>AG[i].n).join(' + ')+' · ' : '';
+  document.getElementById('scope').innerHTML= agOn+
+    (sel.size===nP?'all projects':sel.size+' of '+nP+' projects')+
     ' · <b>'+C.dates[d0]+'</b> → <b>'+C.dates[d1]+'</b> · '+(d1-d0+1)+' days';
   document.getElementById('window').innerHTML=
     '<b>'+fmt(C.meta.totalCalls)+'</b> tool calls<br><b>'+fmt(C.meta.transcripts)+'</b> transcripts · <b>'+
@@ -984,7 +991,7 @@ function render(){
       '<div class="r"><i>share of Bash</i><b>'+p1(pct(r.n,A.bashCalls))+'</b></div>'+
       '<div class="r"><i>calls that errored</i><b>'+fmt(r.e)+' · '+p1(pct(r.e,r.n))+'</b></div>'
   })));
-  document.getElementById('bash-meta').textContent=fmt(A.bashCalls)+' Bash calls';
+  document.getElementById('bash-meta').textContent=fmt(A.bashCalls)+' shell calls';
 
   /* web */
   const wr=C.domains.map((d,i)=>({d,s:A.W[i][0],f:A.W[i][1]})).filter(r=>(r.s+r.f)&&r.d!=='· other')
@@ -1054,6 +1061,34 @@ if(!C.git.length){ const g=document.getElementById('tab-git'); if(g) g.remove();
 /* ---- controls ---- */
 const projTotals=C.projects.map(()=>0);
 for(const [d,p,t,n] of C.A) projTotals[p]+=n;
+/* agent chips select every project belonging to that agent */
+const AG=C.agents||[];
+if(AG.length>1){
+  const row=document.getElementById('agent-row'); row.hidden=false;
+  const projOf=a=>C.projects.map((p,i)=>[p,i]).filter(([p])=>p.a===a).map(([,i])=>i);
+  document.getElementById('agent-chips').innerHTML=AG.map((a,i)=>{
+    const n=projOf(i).length;
+    return '<button class="chip" data-ag="'+i+'" aria-pressed="true">'+esc(a.n)+
+      '<span class="cn">'+n+'</span></button>';}).join('');
+  document.getElementById('agent-chips').addEventListener('click',e=>{
+    const b=e.target.closest('[data-ag]'); if(!b) return;
+    const i=+b.dataset.ag, mine=projOf(i);
+    const allOn=AG.every((_,j)=>projOf(j).every(p=>sel.has(p)));
+    if(allOn) sel=new Set(mine);
+    else if(mine.every(p=>sel.has(p))){ mine.forEach(p=>sel.delete(p));
+      if(!sel.size) sel=new Set(C.projects.map((_,j)=>j)); }
+    else mine.forEach(p=>sel.add(p));
+    syncAgents(); drawChips(); render();
+  });
+}
+function syncAgents(){
+  if(AG.length<2) return;
+  const projOf=a=>C.projects.map((p,i)=>[p,i]).filter(([p])=>p.a===a).map(([,i])=>i);
+  document.querySelectorAll('[data-ag]').forEach(b=>{
+    const mine=projOf(+b.dataset.ag);
+    b.setAttribute('aria-pressed', mine.some(p=>sel.has(p))?'true':'false');
+  });
+}
 const SHOWN=10; let chipsOpen=false;
 function chipHTML(i){const p=C.projects[i];
   return '<button class="chip" data-p="'+i+'" aria-pressed="true" title="'+esc(p.k)+'">'+esc(p.n)+
@@ -1062,7 +1097,7 @@ function drawChips(){
   const n=chipsOpen?nP:Math.min(SHOWN,nP);
   let h=C.projects.slice(0,n).map((_,i)=>chipHTML(i)).join('');
   if(nP>SHOWN) h+='<button class="btn" id="more">'+(chipsOpen?'fewer':'+'+(nP-SHOWN)+' smaller')+'</button>';
-  document.getElementById('chips').innerHTML=h; syncChips();
+  document.getElementById('chips').innerHTML=h; syncChips(); syncAgents();
 }
 drawChips();
 document.getElementById('chips').addEventListener('click',e=>{

@@ -1,15 +1,25 @@
 # cc-toolstat
 
-Audit your own Claude Code tool usage. Points at the session transcripts already on your
-disk, and produces a queryable table, a text report, and a self-contained interactive
-dashboard.
+Audit your own coding-agent tool usage. Points at the session transcripts already on your
+disk — **Claude Code, Codex and Grok** — and produces a queryable table, a text report, and
+a self-contained interactive dashboard.
 
 One file, Python standard library only. It reads local files and uploads nothing.
 
 ```bash
 curl -sO https://raw.githubusercontent.com/harvard-agentic-system/claude-code-tool-analysis/main/cc_toolstat.py
-python3 cc_toolstat.py --open
+python3 cc_toolstat.py --list-agents   # what it can see on this machine
+python3 cc_toolstat.py --open          # analyse everything it found
 ```
+
+| agent | read from | notes |
+|---|---|---|
+| Claude Code | `~/.claude/projects/**/*.jsonl` | richest source; everything below is available |
+| Codex | `~/.codex/sessions/**/rollout-*.jsonl` | tool durations are dispatch-only (see below) |
+| Grok | `~/.grok/sessions/**/updates.jsonl` | tool timestamps are whole seconds |
+
+Every row in every table carries an `agent` column, and the dashboard gets an agent filter,
+so you can compare corpora or isolate one.
 
 ## What it answers
 
@@ -62,7 +72,9 @@ python3 cc_toolstat.py --dir ~/other/.claude --out ~/audit
 
 | flag | effect |
 |---|---|
-| `--dir PATH` | Claude data dir. Defaults to `$CLAUDE_CONFIG_DIR`, then `~/.claude`, then `~/.config/claude` |
+| `--agent NAME` | limit to one agent (`claude`, `codex`, `grok`); repeatable |
+| `--list-agents` | show which agents have transcripts here, then exit |
+| `--dir PATH` | data dir for the selected agent, overriding its default location |
 | `--out DIR` | output directory (default `cc-toolstat-out`) |
 | `--since` / `--until` | filter by local date, `YYYY-MM-DD` |
 | `--redact` | strip paths, commands, queries, URLs and project names |
@@ -164,6 +176,33 @@ those are truncated at exactly 201 characters and are useless for length statist
 the harness injects in the user role (`<task-notification>`, monitor events, system
 reminders) are excluded; on the development corpus that removed 268 of 2,964 apparent
 prompts.
+
+## Comparing across agents
+
+Two clocks differ per agent, and the tool refuses to blend them silently.
+
+**Tool duration.** Every call carries a `duration_basis`, and only wall-clock bases enter
+the latency statistics. Codex runs every command through a persistent shell, so the
+duration it records is dispatch, not runtime — 91% of its command executions record under
+1 ms. Those rows stay in the parquet, marked `dispatch_only`, and are excluded from
+percentiles. Grok's timestamps are whole seconds, so its tool latency is marked
+`wall_clock_1s` and quantises to 1 s.
+
+**Turn latency.** Claude's is trigger → last block, so it contains queue, prefill and
+decode. Codex's is generation-item time only, with no queue or prefill. Grok reports its own
+`apiDurationMs`. The report prints a `latency_basis` table and says plainly not to compare
+the p50 column across agents without reading it.
+
+Everything counted by category rather than tool name — shell work, file reads, web calls —
+compares cleanly, because Claude's `Bash`, Codex's `exec` and Grok's `run_terminal_command`
+all land in the `shell` category.
+
+## Adding another agent
+
+A reader is a function `parse(path, root) -> (calls, urls, turns, events)` plus one entry in
+`AGENTS` giving its label, base directories and glob. Emit rows with the same keys the
+existing readers use, set `agent` and `duration_basis`, and everything downstream — dedupe,
+report, cube, dashboard — works unchanged.
 
 ## Caveats
 
