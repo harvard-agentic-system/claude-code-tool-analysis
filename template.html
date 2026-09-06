@@ -266,6 +266,40 @@ tr:hover td{background:var(--rule-2)}
     </section>
   </div>
 
+
+  <div class="grid2">
+    <section class="panel">
+      <div class="phead"><h2>Extended thinking</h2><span class="pmeta" id="think-meta"></span></div>
+      <p class="pnote">Thinking tokens per inference, when the model thinks at all. The split
+      underneath is what that costs in latency.</p>
+      <div id="think-hist"></div>
+      <div class="latstats" id="think-stats" style="margin-top:14px"></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><h2>What follows what</h2><span class="pmeta" id="trans-meta"></span></div>
+      <p class="pnote">Tool-to-tool transitions within a session. The diagonal is a tool repeating
+      — darker means a longer run of the same work.</p>
+      <div id="trans-heat"></div>
+      <div id="recovery" style="margin-top:16px"></div>
+    </section>
+  </div>
+
+  <div class="grid2">
+    <section class="panel">
+      <div class="phead"><h2>Code churn</h2><span class="pmeta" id="churn-meta"></span></div>
+      <p class="pnote" id="note-churn"></p>
+      <div class="bars" id="churn" style="--lw:66px;--vw:112px"></div>
+      <div class="legend" id="churn-legend" style="margin-top:13px"></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><h2>Your side of the keyboard</h2><span class="pmeta" id="you-meta"></span></div>
+      <p class="pnote">Messages queued while Claude was working, and how long your typed prompts
+      run. Harness-injected turns are excluded.</p>
+      <div id="queue-funnel"></div>
+      <div id="prompt-hist" style="margin-top:18px"></div>
+    </section>
+  </div>
+
   <div class="grid2">
     <section class="panel">
       <div class="phead"><h2>Hour of day</h2><span class="pmeta">local time</span></div>
@@ -374,16 +408,33 @@ function agg(){
   for (const [d,p,t,b,cn] of (C.L||[])){ if(!inF(d,p)) continue; LT[b]+=cn; LTby[t][b]+=cn; }
   for (const [d,p,m,b,cn] of (C.M||[])){ if(!inF(d,p)) continue; LM[b]+=cn; LMby[m][b]+=cn; }
   let turnN=0, turnLat=0, turnOut=0, turnIn=0, cacheRead=0, cacheCreate=0;
-  for (const [d,p,m,n,lat,out,inp,cr,cc] of (C.N||[])){
+  let thinkTok=0, c5m=0, c1h=0;
+  for (const [d,p,m,n,lat,out,inp,cr,cc,th,e5,e1] of (C.N||[])){
     if(!inF(d,p)) continue;
     turnN+=n; turnLat+=lat; turnOut+=out; turnIn+=inp; cacheRead+=cr; cacheCreate+=cc;
+    thinkTok+=th||0; c5m+=e5||0; c1h+=e1||0;
   }
+  const nT=C.tools.length;
+  const trans=Array.from({length:nT},()=>new Array(nT).fill(0));
+  for (const [d,p,a,b,cn] of (C.P||[])){ if(inF(d,p)) trans[a][b]+=cn; }
+  const rec=[0,0,0,0];   // same+ok, other+ok, same+fail, other+fail
+  for (const [d,p,sm,ok,cn] of (C.R||[])){ if(inF(d,p)) rec[(ok?0:2)+(sm?0:1)]+=cn; }
+  const TH=new Array(C.thinkEdges.length).fill(0);
+  for (const [d,p,m,b,cn] of (C.TH||[])){ if(inF(d,p)) TH[b]+=cn; }
+  const CH=C.exts.map(()=>[0,0,0]);
+  for (const [d,p,x,ad,rm,ne] of (C.CH||[])){
+    if(!inF(d,p)) continue; CH[x][0]+=ad; CH[x][1]+=rm; CH[x][2]+=ne; }
+  const Q=[0,0,0];
+  for (const [d,p,q,cn] of (C.Q||[])){ if(inF(d,p)) Q[q]+=cn; }
+  const PRM=new Array(C.promptEdges.length).fill(0);
+  for (const [d,p,b,cn] of (C.PRM||[])){ if(inF(d,p)) PRM[b]+=cn; }
   let bashCalls=0, bashErr=0;
   C.tools.forEach((t,i)=>{ if(t.n==='Bash'){bashCalls=T[i].n; bashErr=T[i].e;} });
   const notReal = GRPS.filter(g=>NOTREAL.has(g)).reduce((a,g)=>a+G[g],0);
   return {T,cat,daily,n,e,ob,ib,ds,dn,K,G,H,B,W,X,sessions:S.size,side,main,bashCalls,bashErr,
           notReal, LT,LM,LTby,LMby, turnN, turnSecs:turnLat/1000, turnOut,
-          cacheRead, cacheFresh:cacheCreate+turnIn};
+          cacheRead, cacheFresh:cacheCreate+turnIn,
+          trans, rec, TH, CH, Q, PRM, thinkTok, c5m, c1h};
 }
 
 /* ---- tooltip ---- */
@@ -718,6 +769,141 @@ document.querySelector('.lat-switch').addEventListener('click',e=>{
   render();
 });
 
+
+/* ---- thinking, transitions, churn, behaviour ---- */
+const RAMP=['#cde2fb','#9ec5f4','#6da7ec','#3987e5','#256abf','#184f95','#0d366b'];
+function histBars(host, counts, edges, color, fmtEdge){
+  const tot=counts.reduce((a,b)=>a+b,0);
+  if(!tot){ host.innerHTML='<div class="empty">Nothing in this selection.</div>'; return; }
+  const W=460,H=124,PL=30,max=Math.max(...counts,1),bw=(W-PL-4)/counts.length;
+  let s=`<svg viewBox="0 0 ${W} ${H+24}">`;
+  for(let i=0;i<counts.length;i++){
+    const h=(H-10)*counts[i]/max;
+    s+=`<rect x="${(PL+i*bw+1).toFixed(1)}" y="${(H-h).toFixed(1)}" width="${(bw-2).toFixed(1)}" `+
+       `height="${Math.max(counts[i]?1:0,h).toFixed(1)}" fill="${color}" rx="1.5"/>`;
+    if(i%2===0) s+=`<text class="ax" x="${(PL+i*bw).toFixed(1)}" y="${H+13}" text-anchor="middle">${fmtEdge(edges[i])}</text>`;
+  }
+  s+=`<text class="ax" x="${PL-5}" y="10" text-anchor="end">${fmt(max)}</text>`;
+  s+=`<line class="bl-axis" x1="${PL}" x2="${W}" y1="${H+.5}" y2="${H+.5}"/></svg>`;
+  host.innerHTML=s;
+  host.querySelectorAll('rect').forEach((r,i)=>bindTip(r,
+    `<b>${fmtEdge(edges[i])} – ${i+1<edges.length?fmtEdge(edges[i+1]):'∞'}</b>`+
+    `<div class="r"><i>turns</i><b>${fmt(counts[i])}</b></div>`+
+    `<div class="r"><i>share</i><b>${p1(pct(counts[i],tot))}</b></div>`));
+}
+const tokLbl = v => v>=1000?(v/1000)+'k':String(v);
+
+function drawThinking(A){
+  const hot=A.TH.slice(1), tot=A.TH.reduce((a,b)=>a+b,0);
+  const hotN=hot.reduce((a,b)=>a+b,0);
+  document.getElementById('think-meta').textContent = tot
+    ? p1(pct(hotN,tot))+' of '+fmt(tot)+' turns think' : 'no turns';
+  histBars(document.getElementById('think-hist'), hot, C.thinkEdges.slice(1),
+           'var(--s7)', tokLbl);
+  const shareThink = A.turnSecs ? A.thinkTok/Math.max(A.turnOut,1) : 0;
+  document.getElementById('think-stats').innerHTML=
+    '<div class="latstat"><span class="k">turns thinking</span><span class="v">'+
+      p1(pct(hotN,tot))+'</span></div>'+
+    '<div class="latstat"><span class="k">thinking tokens</span><span class="v">'+
+      fmt(A.thinkTok)+'</span></div>'+
+    '<div class="latstat"><span class="k">share of output</span><span class="v">'+
+      p1(100*shareThink)+'</span></div>'+
+    '<div class="latstat"><span class="k">cache 1h share</span><span class="v">'+
+      p1(pct(A.c1h,A.c5m+A.c1h))+'</span></div>';
+}
+
+function drawTransitions(A){
+  const idx=C.tools.map((t,i)=>i)
+    .filter(i=>A.T[i].n>0)
+    .sort((a,b)=>A.T[b].n-A.T[a].n).slice(0,8);
+  const meta=document.getElementById('trans-meta');
+  const host=document.getElementById('trans-heat');
+  const tot=A.trans.reduce((a,row)=>a+row.reduce((x,y)=>x+y,0),0);
+  if(!idx.length||!tot){ host.innerHTML='<div class="empty">No transitions.</div>';
+    meta.textContent=''; return; }
+  let mx=0; idx.forEach(a=>idx.forEach(b=>{ mx=Math.max(mx,A.trans[a][b]); }));
+  const N=idx.length, CELL=34, PL=104, PT=54, W=PL+N*CELL+8;
+  let s=`<svg viewBox="0 0 ${W} ${PT+N*CELL+8}" role="img" aria-label="Tool transition matrix">`;
+  idx.forEach((b,j)=>{
+    const x=PL+j*CELL+CELL/2;
+    s+=`<text class="ax" transform="rotate(-45 ${x} ${PT-8})" x="${x}" y="${PT-8}" text-anchor="start" style="font-size:9.5px">${esc(C.tools[b].n).slice(0,11)}</text>`;
+  });
+  idx.forEach((a,i)=>{
+    s+=`<text class="ax" x="${PL-7}" y="${PT+i*CELL+CELL/2+3.5}" text-anchor="end" style="font-size:10px;fill:var(--ink-2)">${esc(C.tools[a].n).slice(0,14)}</text>`;
+    idx.forEach((b,j)=>{
+      const v=A.trans[a][b];
+      // colour on a log scale, and label on the same scale - a linear label
+      // threshold leaves every cell but the peak unlabelled.
+      const si=v? Math.min(RAMP.length-1, Math.floor(Math.log(1+v)/Math.log(1+mx)*RAMP.length)) : -1;
+      s+=`<rect data-a="${a}" data-b="${b}" x="${PL+j*CELL+1}" y="${PT+i*CELL+1}" width="${CELL-2}" height="${CELL-2}" fill="${si<0?'var(--sunken)':RAMP[si]}" rx="2"/>`;
+      if(v){
+        const lbl = v>=10000?(v/1000).toFixed(0)+'k' : v>=1000?(v/1000).toFixed(1)+'k' : String(v);
+        s+=`<text x="${PL+j*CELL+CELL/2}" y="${PT+i*CELL+CELL/2+3.5}" text-anchor="middle" style="font-family:var(--mono);font-size:8.5px;fill:${si>=4?'#fff':'#0b0b0b'}">${lbl}</text>`;
+      }
+    });
+  });
+  s+='</svg>';
+  host.innerHTML=s;
+  meta.textContent=fmt(tot)+' transitions';
+  host.querySelectorAll('rect[data-a]').forEach(r=>{
+    const a=+r.dataset.a, b=+r.dataset.b, v=A.trans[a][b];
+    bindTip(r,`<b>${esc(C.tools[a].n)} → ${esc(C.tools[b].n)}</b>`+
+      `<div class="r"><i>times</i><b>${fmt(v)}</b></div>`+
+      `<div class="r"><i>of all</i><b>${p1(pct(v,tot))}</b></div>`);
+  });
+  const rec=A.rec, rtot=rec.reduce((a,b)=>a+b,0);
+  document.getElementById('recovery').innerHTML = rtot
+    ? '<div class="comp" style="height:26px">'+
+      [[0,'same tool, recovered','--s3'],[1,'other tool, recovered','--s1'],
+       [2,'same tool, failed again','--s2'],[3,'other tool, failed again','--s8']]
+      .filter(([i])=>rec[i]).map(([i,lbl,col])=>
+        '<span title="'+lbl+'" style="flex:'+rec[i]+';background:var('+col+')">'+
+        (rec[i]/rtot>0.12?p1(pct(rec[i],rtot)):'')+'</span>').join('')+'</div>'+
+      '<div class="lgi" style="font-size:12.5px;color:var(--ink-2)">After a failed call, <b>'+
+      p1(pct(rec[0]+rec[1],rtot))+'</b> recover on the very next one ('+fmt(rtot)+' cases)</div>'
+    : '';
+}
+
+function drawChurn(A){
+  const rows=C.exts.map((x,i)=>({x, a:A.CH[i][0], r:A.CH[i][1], n:A.CH[i][2]}))
+    .filter(r=>r.a+r.r).sort((a,b)=>(b.a+b.r)-(a.a+a.r)).slice(0,10);
+  const add=rows.reduce((s,r)=>s+r.a,0), rem=rows.reduce((s,r)=>s+r.r,0);
+  const edits=rows.reduce((s,r)=>s+r.n,0);
+  document.getElementById('note-churn').textContent=C.copy.churn;
+  document.getElementById('churn-meta').textContent=edits?fmt(edits)+' edits with a diff':'no diffs';
+  barList(document.getElementById('churn'), rows.map(r=>({
+    label:r.x, v:r.a, v2:r.r, color:'var(--s3)', color2:'var(--s8)',
+    right:'+'+fmt(r.a)+' <i>−'+fmt(r.r)+'</i>',
+    tip:'<b>'+esc(r.x)+'</b><div class="r"><i>edits</i><b>'+fmt(r.n)+'</b></div>'+
+      '<div class="r"><i>added</i><b>'+fmt(r.a)+'</b></div>'+
+      '<div class="r"><i>removed</i><b>'+fmt(r.r)+'</b></div>'
+  })));
+  document.getElementById('churn-legend').innerHTML=
+    '<span class="lgi"><span class="sw" style="background:var(--s3)"></span>added <b>'+fmt(add)+'</b></span>'+
+    '<span class="lgi"><span class="sw" style="background:var(--s8)"></span>removed <b>'+fmt(rem)+'</b></span>'+
+    (rem?'<span class="lgi" style="color:var(--muted)">'+(add/rem).toFixed(1)+':1 add to remove</span>':'');
+}
+
+function drawYou(A){
+  const [enq,deq,rem]=A.Q;
+  document.getElementById('you-meta').textContent = enq? fmt(enq)+' messages queued' : '';
+  document.getElementById('queue-funnel').innerHTML = enq
+    ? '<div class="comp" style="height:30px">'+
+      '<span style="flex:'+Math.max(deq,1)+';background:var(--s1)">'+(deq/enq>0.15?fmt(deq)+' ran':'')+'</span>'+
+      '<span style="flex:'+Math.max(rem,1)+';background:var(--s2)">'+(rem/enq>0.15?fmt(rem)+' pulled back':'')+'</span>'+
+      '</div><div class="lgi" style="font-size:12.5px;color:var(--ink-2)">You pulled back <b>'+
+      p1(pct(rem,enq))+'</b> of what you queued while Claude was working</div>'
+    : '<div class="empty">No queued messages in this selection.</div>';
+  const ph=document.getElementById('prompt-hist');
+  const tot=A.PRM.reduce((a,b)=>a+b,0);
+  if(tot){
+    ph.innerHTML='<div class="eyebrow" style="margin-bottom:7px">typed prompt length · '+
+      fmt(tot)+' prompts</div><div id="prompt-hist-svg"></div>';
+    histBars(document.getElementById('prompt-hist-svg'), A.PRM, C.promptEdges,
+             'var(--s4)', v=>v>=1000?(v/1000)+'k':String(v));
+  } else ph.innerHTML='';
+}
+
 /* ---- render ---- */
 function render(){
   const A=agg();
@@ -816,6 +1002,10 @@ function render(){
   document.getElementById('web-meta').textContent=wr.length?wr.length+' domains shown':'no web activity';
 
   drawLatency(A);
+  drawThinking(A);
+  drawTransitions(A);
+  drawChurn(A);
+  drawYou(A);
 
   /* hours + exts */
   drawHours(A);

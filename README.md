@@ -27,6 +27,13 @@ python3 cc_toolstat.py --open
   issued → result landed) and *model turn latency* (triggering result → last block of the
   reply). Percentiles, not means, plus end-to-end output tokens/sec, cache hit ratio, and
   where your machine time actually goes.
+- **How hard is the model thinking?** Extended-thinking tokens per turn, how often thinking
+  fires, what it costs in latency, and the prompt-cache TTL mix.
+- **What follows what?** A tool-to-tool transition matrix, and whether a failed call recovers
+  on the next one.
+- **How much code moved?** Lines added and removed per edit, by file type.
+- **Your own habits**: how many messages you queue while Claude works and how many you pull
+  back, and how long your typed prompts actually run.
 - Plus: hour-of-day rhythm, file types touched, git subcommand mix, per-project breakdown,
   main-thread versus subagent share, model and entrypoint mix.
 
@@ -36,7 +43,7 @@ python3 cc_toolstat.py --open
 |---|---|
 | `tool_calls.parquet` | one row per tool call, 38 columns — the fact table |
 | `web_urls.parquet` | one row per URL searched or fetched |
-| `model_turns.parquet` | one row per inference: latency, tokens, cache hit, stop reason |
+| `model_turns.parquet` | one row per inference: latency, tokens, thinking, cache TTL, stop reason |
 | `dashboard.html` | self-contained interactive dashboard, filterable by project and date |
 | `report.txt` | the same analysis as plain text |
 
@@ -133,6 +140,30 @@ turn beside it so the comparison is interpretable.
 The dashboard recomputes percentiles under your filters from a log-bucketed histogram
 (~1.6× steps), so its figures interpolate within a bucket and land within a few percent of
 the exact ones. `report.txt` computes exact percentiles from the raw rows.
+
+## Model internals, workflow shape, churn
+
+Four more seams, each with its own footnote:
+
+**Extended thinking.** `output_tokens_details.thinking_tokens` is per request, not per
+transcript line — and on about 3% of requests it is absent from the first line and present
+on a later one. Reading only the first line loses those: on the development corpus that was
+the difference between 5,965 and 13,815 turns with thinking recorded. Turns take the maximum
+seen across the request's lines.
+
+**Transitions and recovery.** Tool-to-tool transitions come from ordering calls within a
+session. On the development corpus 70% of transitions repeat the same tool — work arrives in
+runs, not alternation — and 85% of failed calls recover on the very next one.
+
+**Code churn** comes from `structuredPatch` on edit results, counting `+` and `-` lines.
+Only an edit against an existing file carries a patch, so this covers about 20% of file
+writes; creating a new file produces nothing to count. The panel states its own coverage.
+
+**Your typed prompts** are measured from message bodies, not the `last-prompt` records —
+those are truncated at exactly 201 characters and are useless for length statistics. Turns
+the harness injects in the user role (`<task-notification>`, monitor events, system
+reminders) are excluded; on the development corpus that removed 268 of 2,964 apparent
+prompts.
 
 ## Caveats
 

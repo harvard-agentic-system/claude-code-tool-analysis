@@ -117,6 +117,12 @@ HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
 SPLIT = re.compile(r"\n|&&|\|\||;|\|")
 TOKEN = re.compile(
     r"^\s*(?:(?:sudo|time|nohup|command|exec|xargs)\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*([\w./+-]+)")
+# User-role turns the harness injects on your behalf: task notifications, monitor
+# events, command output, system reminders. They are not typed prompts.
+INJECTED = re.compile(
+    r"^\s*<(task-notification|ci-monitor-event|event|note|system-reminder|"
+    r"local-command-\w+|command-\w+|user-prompt-submit-hook|tool-use-id)\b", re.I)
+
 SHELL_KW = {
     "if", "then", "else", "elif", "fi", "for", "do", "done", "while", "until", "case",
     "esac", "in", "function", "cd", "set", "export", "local", "return", "source", ".",
@@ -233,12 +239,12 @@ def parse_transcript(args):
     # One API call is written as several transcript lines - one per content
     # block - all sharing a requestId and repeating the same usage totals. So
     # group by requestId rather than treating each line as an inference.
-    turns, order = {}, []
+    turns, order, events = {}, [], []
     human_ts = machine_ts = None
     try:
         fh = open(path, errors="replace")
     except OSError:
-        return [], [], []
+        return [], [], [], []
     with fh:
         for line in fh:
             line = line.strip()
@@ -248,10 +254,43 @@ def parse_transcript(args):
                 d = json.loads(line)
             except Exception:
                 continue
+
+            kind = d.get("type")
+            if kind in ("ai-title", "queue-operation"):
+                events.append({
+                    "kind": "title" if kind == "ai-title" else "queue",
+                    "session_id": d.get("sessionId"), "project": project,
+                    "ts": d.get("timestamp"),
+                    "value": d.get("aiTitle") if kind == "ai-title" else d.get("operation"),
+                })
+                continue
+            if d.get("subtype") == "compact_boundary":
+                cm = d.get("compactMetadata") or {}
+                events.append({
+                    "kind": "compact", "session_id": d.get("sessionId"), "project": project,
+                    "ts": d.get("timestamp"),
+                    "value": "%s:%s" % (cm.get("trigger"), cm.get("preTokens") or 0),
+                })
+                continue
+
             msg = d.get("message")
             if not isinstance(msg, dict):
                 continue
             content = msg.get("content")
+
+            if kind == "user" and not d.get("isMeta"):
+                text = ""
+                if isinstance(content, str):
+                    text = content.strip()
+                elif isinstance(content, list) and not any(
+                        isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                    text = "\n".join((b.get("text") or "") for b in content
+                                     if isinstance(b, dict) and b.get("type") == "text").strip()
+                chars = 0 if INJECTED.match(text) else len(text)
+                if chars:
+                    events.append({"kind": "prompt", "session_id": d.get("sessionId"),
+                                   "project": project, "ts": d.get("timestamp"), "value": chars})
+
             if not isinstance(content, list):
                 continue
             stamp = d.get("timestamp")
@@ -278,12 +317,28 @@ def parse_transcript(args):
                             "cache_creation_tokens": u.get("cache_creation_input_tokens") or 0,
                             "service_tier": u.get("service_tier"),
                             "speed": u.get("speed"),
+                            "thinking_tokens": ((u.get("output_tokens_details") or {})
+                                                .get("thinking_tokens") or 0),
+                            "cache_5m_tokens": ((u.get("cache_creation") or {})
+                                                .get("ephemeral_5m_input_tokens") or 0),
+                            "cache_1h_tokens": ((u.get("cache_creation") or {})
+                                                .get("ephemeral_1h_input_tokens") or 0),
                             "is_sidechain": bool(d.get("isSidechain")) or from_subagent,
                             "entrypoint": d.get("entrypoint"),
                             "blocks": 0, "tool_uses": 0, "thinking": False,
                         }
                         order.append(rid)
                     t["last_ms"] = max(t["last_ms"], now)
+                    u2 = msg.get("usage") or {}
+                    otd = u2.get("output_tokens_details") or {}
+                    cc2 = u2.get("cache_creation") or {}
+                    for field, val in (
+                            ("thinking_tokens", otd.get("thinking_tokens")),
+                            ("cache_5m_tokens", cc2.get("ephemeral_5m_input_tokens")),
+                            ("cache_1h_tokens", cc2.get("ephemeral_1h_input_tokens")),
+                            ("output_tokens", u2.get("output_tokens"))):
+                        if val:
+                            t[field] = max(t.get(field) or 0, val)
                     t["blocks"] += len(content)
                     t["tool_uses"] += sum(1 for b in content
                                           if isinstance(b, dict) and b.get("type") == "tool_use")
@@ -349,6 +404,8 @@ def parse_transcript(args):
                         "is_error": None, "error_kind": None, "error_group": None,
                         "error_text": None, "output_bytes": None,
                         "duration_ms": None, "result_ts": None,
+                        "lines_added": None, "lines_removed": None,
+                        "resolved_model": None,
                     })
                     pending[b.get("id")] = len(calls) - 1
                     if name == "WebFetch" and isinstance(inp.get("url"), str):
@@ -378,6 +435,20 @@ def parse_transcript(args):
                     if a and z and z >= a:
                         row["duration_ms"] = z - a
                     tur = d.get("toolUseResult")
+                    if isinstance(tur, dict):
+                        # Edits carry the applied diff; a newly created file has none.
+                        patch = tur.get("structuredPatch")
+                        if isinstance(patch, list) and patch:
+                            add = rem = 0
+                            for hunk in patch:
+                                for ln in (hunk.get("lines") or []) if isinstance(hunk, dict) else []:
+                                    if ln.startswith("+"):
+                                        add += 1
+                                    elif ln.startswith("-"):
+                                        rem += 1
+                            row["lines_added"], row["lines_removed"] = add, rem
+                        if isinstance(tur.get("resolvedModel"), str):
+                            row["resolved_model"] = tur["resolvedModel"]
                     if isinstance(tur, dict) and "results" in tur and "query" in tur:
                         for res in tur.get("results") or []:
                             items = res.get("content") if isinstance(res, dict) else None
@@ -405,7 +476,7 @@ def parse_transcript(args):
         t["cache_hit_ratio"] = round(cached / (cached + fresh), 4) if (cached + fresh) else None
         for k in ("trigger_ms", "first_ms", "last_ms"):
             t.pop(k)
-    return calls, urls, [turns[r] for r in order]
+    return calls, urls, [turns[r] for r in order], events
 
 
 def _trigger(human_ts, machine_ts):
@@ -501,7 +572,7 @@ def shorten_projects(keys):
     return labels
 
 
-def redact_rows(calls, urls, turns=()):
+def redact_rows(calls, urls, turns=(), events=()):
     """Strip everything that could identify a person, machine or codebase."""
     salt = os.urandom(8).hex()
 
@@ -536,7 +607,12 @@ def redact_rows(calls, urls, turns=()):
         t["session_id"] = h(t.get("session_id"), 10)
         t["transcript"] = h(t.get("transcript"))
         t["request_id"] = h(t.get("request_id"), 10)
-    return calls, urls, turns
+    for e in events:
+        e["project"] = projmap.get(e.get("project"), "project-?")
+        e["session_id"] = h(e.get("session_id"), 10)
+        if e.get("kind") == "title":
+            e["value"] = "(redacted)"
+    return calls, urls, turns, events
 
 
 # Log-spaced edges for the latency histogram the dashboard filters on. Exact
@@ -551,6 +627,21 @@ LAT_EDGES = [0, 5, 10, 15, 25, 40, 60, 100, 150, 250, 400, 600, 1000, 1500, 2500
 # mean the session was paused, interrupted or resumed, and the wall clock kept
 # running. Such turns are flagged and kept out of latency statistics.
 IDLE_CUTOFF_MS = 600_000
+
+# Log-ish ladders for the two token/size histograms the dashboard filters on.
+THINK_EDGES = [0, 1, 50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000]
+PROMPT_EDGES = [0, 50, 150, 400, 1000, 2500, 6000, 15000, 40000, 100000, 400000]
+
+
+def bucket_of(edges, v):
+    lo, hi = 0, len(edges)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if edges[mid] <= v:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo - 1 if lo else 0
 
 
 def lat_bucket(ms):
@@ -647,7 +738,7 @@ def topn(counter, n, other="· other"):
     return keys + ([other] if len(counter) > len(keys) else [])
 
 
-def build_cube(calls, urls, turns, git_counter, redacted=False):
+def build_cube(calls, urls, turns, events, git_counter, redacted=False):
     for r in calls:
         r["date"], r["hour"] = local_parts(r["ts"])
     for u in urls:
@@ -746,7 +837,7 @@ def build_cube(calls, urls, turns, git_counter, redacted=False):
     model_n = Counter(t["model"] for t in tlive if t.get("model"))
     models = [m for m, _ in model_n.most_common()]
     mi = {v: i for i, v in enumerate(models)}
-    M, N = Counter(), defaultdict(lambda: [0] * 6)
+    M, N = Counter(), defaultdict(lambda: [0] * 9)
     for t in tlive:
         if t.get("model") not in mi:
             continue
@@ -761,6 +852,60 @@ def build_cube(calls, urls, turns, git_counter, redacted=False):
         cell[3] += t.get("input_tokens") or 0
         cell[4] += t.get("cache_read_tokens") or 0
         cell[5] += t.get("cache_creation_tokens") or 0
+        cell[6] += t.get("thinking_tokens") or 0
+        cell[7] += t.get("cache_5m_tokens") or 0
+        cell[8] += t.get("cache_1h_tokens") or 0
+
+    # Thinking effort, bucketed like latency so it filters the same way.
+    TH = Counter()
+    for t in tlive:
+        if t.get("model") in mi:
+            TH[(di[t["date"]], pi[t["project"]], mi[t["model"]],
+                bucket_of(THINK_EDGES, t.get("thinking_tokens") or 0))] += 1
+
+    # Which tool follows which, and whether a failure recovers on the next call.
+    by_session = defaultdict(list)
+    for r in live:
+        by_session[r["session_id"]].append(r)
+    P, R = Counter(), Counter()
+    for rows in by_session.values():
+        rows.sort(key=lambda r: r["ts_ms"] or 0)
+        for a, b in zip(rows, rows[1:]):
+            P[(di[b["date"]], pi[b["project"]], ti[a["tool_name"]], ti[b["tool_name"]])] += 1
+            if a["is_error"]:
+                R[(di[b["date"]], pi[b["project"]],
+                   1 if a["tool_name"] == b["tool_name"] else 0,
+                   0 if b["is_error"] else 1)] += 1
+
+    # Diff churn. Only edits against an existing file carry a patch.
+    CH = defaultdict(lambda: [0, 0, 0])
+    for r in live:
+        if r.get("lines_added") is None and r.get("lines_removed") is None:
+            continue
+        cell = CH[(di[r["date"]], pi[r["project"]],
+                   xi.get(r["file_ext"] or "(none)", xi.get("· other", 0)))]
+        cell[0] += r.get("lines_added") or 0
+        cell[1] += r.get("lines_removed") or 0
+        cell[2] += 1
+
+    # Session-scoped behaviour: queueing, prompt size, readable titles.
+    QOPS = ["enqueue", "dequeue", "remove"]
+    qi = {v: i for i, v in enumerate(QOPS)}
+    Q, PRM, titles, compacts = Counter(), Counter(), {}, []
+    for e in events:
+        ed, _ = local_parts(e.get("ts")) if e.get("ts") else (None, None)
+        p = pi.get(e.get("project"))
+        if e["kind"] == "title" and e.get("session_id"):
+            titles[e["session_id"]] = e["value"]
+            continue
+        if ed not in di or p is None:
+            continue
+        if e["kind"] == "queue" and e["value"] in qi:
+            Q[(di[ed], p, qi[e["value"]])] += 1
+        elif e["kind"] == "prompt":
+            PRM[(di[ed], p, bucket_of(PROMPT_EDGES, int(e["value"])))] += 1
+        elif e["kind"] == "compact":
+            compacts.append([di[ed], p, str(e["value"])])
 
     q_agg = Counter()
     for u in urls:
@@ -796,6 +941,14 @@ def build_cube(calls, urls, turns, git_counter, redacted=False):
         "I": [[u, p, n] for (u, p), n in f_agg.most_common(150)],
         "J": [[d, p, s, n] for (d, p, s), n in J.items()],
         "L": [[d, p, t, b, n] for (d, p, t, b), n in L.items()],
+        "P": [[d, p, a, b, n] for (d, p, a, b), n in P.items()],
+        "R": [[d, p, sm, ok, n] for (d, p, sm, ok), n in R.items()],
+        "TH": [[d, p, m, b, n] for (d, p, m, b), n in TH.items()],
+        "CH": [[d, p, x] + v for (d, p, x), v in CH.items()],
+        "Q": [[d, p, q, n] for (d, p, q), n in Q.items()],
+        "PRM": [[d, p, b, n] for (d, p, b), n in PRM.items()],
+        "qops": QOPS, "compacts": compacts,
+        "thinkEdges": THINK_EDGES, "promptEdges": PROMPT_EDGES,
         "M": [[d, p, m, b, n] for (d, p, m, b), n in M.items()],
         "N": [[d, p, m] + v for (d, p, m), v in N.items()],
         "models": models,
@@ -829,6 +982,9 @@ def build_cube(calls, urls, turns, git_counter, redacted=False):
         "idleTurns": sum(1 for t in tlive if t.get("idle")),
         "idleCutoffMs": IDLE_CUTOFF_MS,
         "timedCalls": sum(1 for r in live if r["duration_ms"] is not None),
+        "editsWithDiff": sum(1 for r in live if r.get("lines_added") is not None),
+        "fileWrites": sum(1 for r in live if r["tool_category"] == "file_write"),
+        "sessionTitles": len(titles),
         "activeDays": len(dates),
         "calendarDays": calendar_days,
         "firstDate": dates[0] if dates else "",
@@ -884,6 +1040,10 @@ def build_copy(meta, n_err, n_notreal, n_side, n_all, top_cat, top_tool, grp_n, 
                    % (fmt_int(meta["transcripts"]), "your Claude Code data directory",
                       fmt_int(meta["totalCalls"]), fmt_int(meta["totalSessions"]),
                       meta["projects"])),
+        "churn": ("Lines added and removed per edit. Only an edit against an existing file "
+                  "carries a diff, so this covers %s of %s file writes — creating a new file "
+                  "produces no patch to count."
+                  % (fmt_int(meta.get("editsWithDiff", 0)), fmt_int(meta.get("fileWrites", 0)))),
         "latTool": ("Wall clock from the tool call being issued to its result landing. It "
                     "includes the work itself and, where a call needed approval, however long "
                     "that took — which is why percentiles are shown rather than a mean. "
@@ -1178,6 +1338,40 @@ tr:hover td{background:var(--rule-2)}
     </section>
   </div>
 
+
+  <div class="grid2">
+    <section class="panel">
+      <div class="phead"><h2>Extended thinking</h2><span class="pmeta" id="think-meta"></span></div>
+      <p class="pnote">Thinking tokens per inference, when the model thinks at all. The split
+      underneath is what that costs in latency.</p>
+      <div id="think-hist"></div>
+      <div class="latstats" id="think-stats" style="margin-top:14px"></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><h2>What follows what</h2><span class="pmeta" id="trans-meta"></span></div>
+      <p class="pnote">Tool-to-tool transitions within a session. The diagonal is a tool repeating
+      — darker means a longer run of the same work.</p>
+      <div id="trans-heat"></div>
+      <div id="recovery" style="margin-top:16px"></div>
+    </section>
+  </div>
+
+  <div class="grid2">
+    <section class="panel">
+      <div class="phead"><h2>Code churn</h2><span class="pmeta" id="churn-meta"></span></div>
+      <p class="pnote" id="note-churn"></p>
+      <div class="bars" id="churn" style="--lw:66px;--vw:112px"></div>
+      <div class="legend" id="churn-legend" style="margin-top:13px"></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><h2>Your side of the keyboard</h2><span class="pmeta" id="you-meta"></span></div>
+      <p class="pnote">Messages queued while Claude was working, and how long your typed prompts
+      run. Harness-injected turns are excluded.</p>
+      <div id="queue-funnel"></div>
+      <div id="prompt-hist" style="margin-top:18px"></div>
+    </section>
+  </div>
+
   <div class="grid2">
     <section class="panel">
       <div class="phead"><h2>Hour of day</h2><span class="pmeta">local time</span></div>
@@ -1286,16 +1480,33 @@ function agg(){
   for (const [d,p,t,b,cn] of (C.L||[])){ if(!inF(d,p)) continue; LT[b]+=cn; LTby[t][b]+=cn; }
   for (const [d,p,m,b,cn] of (C.M||[])){ if(!inF(d,p)) continue; LM[b]+=cn; LMby[m][b]+=cn; }
   let turnN=0, turnLat=0, turnOut=0, turnIn=0, cacheRead=0, cacheCreate=0;
-  for (const [d,p,m,n,lat,out,inp,cr,cc] of (C.N||[])){
+  let thinkTok=0, c5m=0, c1h=0;
+  for (const [d,p,m,n,lat,out,inp,cr,cc,th,e5,e1] of (C.N||[])){
     if(!inF(d,p)) continue;
     turnN+=n; turnLat+=lat; turnOut+=out; turnIn+=inp; cacheRead+=cr; cacheCreate+=cc;
+    thinkTok+=th||0; c5m+=e5||0; c1h+=e1||0;
   }
+  const nT=C.tools.length;
+  const trans=Array.from({length:nT},()=>new Array(nT).fill(0));
+  for (const [d,p,a,b,cn] of (C.P||[])){ if(inF(d,p)) trans[a][b]+=cn; }
+  const rec=[0,0,0,0];   // same+ok, other+ok, same+fail, other+fail
+  for (const [d,p,sm,ok,cn] of (C.R||[])){ if(inF(d,p)) rec[(ok?0:2)+(sm?0:1)]+=cn; }
+  const TH=new Array(C.thinkEdges.length).fill(0);
+  for (const [d,p,m,b,cn] of (C.TH||[])){ if(inF(d,p)) TH[b]+=cn; }
+  const CH=C.exts.map(()=>[0,0,0]);
+  for (const [d,p,x,ad,rm,ne] of (C.CH||[])){
+    if(!inF(d,p)) continue; CH[x][0]+=ad; CH[x][1]+=rm; CH[x][2]+=ne; }
+  const Q=[0,0,0];
+  for (const [d,p,q,cn] of (C.Q||[])){ if(inF(d,p)) Q[q]+=cn; }
+  const PRM=new Array(C.promptEdges.length).fill(0);
+  for (const [d,p,b,cn] of (C.PRM||[])){ if(inF(d,p)) PRM[b]+=cn; }
   let bashCalls=0, bashErr=0;
   C.tools.forEach((t,i)=>{ if(t.n==='Bash'){bashCalls=T[i].n; bashErr=T[i].e;} });
   const notReal = GRPS.filter(g=>NOTREAL.has(g)).reduce((a,g)=>a+G[g],0);
   return {T,cat,daily,n,e,ob,ib,ds,dn,K,G,H,B,W,X,sessions:S.size,side,main,bashCalls,bashErr,
           notReal, LT,LM,LTby,LMby, turnN, turnSecs:turnLat/1000, turnOut,
-          cacheRead, cacheFresh:cacheCreate+turnIn};
+          cacheRead, cacheFresh:cacheCreate+turnIn,
+          trans, rec, TH, CH, Q, PRM, thinkTok, c5m, c1h};
 }
 
 /* ---- tooltip ---- */
@@ -1630,6 +1841,141 @@ document.querySelector('.lat-switch').addEventListener('click',e=>{
   render();
 });
 
+
+/* ---- thinking, transitions, churn, behaviour ---- */
+const RAMP=['#cde2fb','#9ec5f4','#6da7ec','#3987e5','#256abf','#184f95','#0d366b'];
+function histBars(host, counts, edges, color, fmtEdge){
+  const tot=counts.reduce((a,b)=>a+b,0);
+  if(!tot){ host.innerHTML='<div class="empty">Nothing in this selection.</div>'; return; }
+  const W=460,H=124,PL=30,max=Math.max(...counts,1),bw=(W-PL-4)/counts.length;
+  let s=`<svg viewBox="0 0 ${W} ${H+24}">`;
+  for(let i=0;i<counts.length;i++){
+    const h=(H-10)*counts[i]/max;
+    s+=`<rect x="${(PL+i*bw+1).toFixed(1)}" y="${(H-h).toFixed(1)}" width="${(bw-2).toFixed(1)}" `+
+       `height="${Math.max(counts[i]?1:0,h).toFixed(1)}" fill="${color}" rx="1.5"/>`;
+    if(i%2===0) s+=`<text class="ax" x="${(PL+i*bw).toFixed(1)}" y="${H+13}" text-anchor="middle">${fmtEdge(edges[i])}</text>`;
+  }
+  s+=`<text class="ax" x="${PL-5}" y="10" text-anchor="end">${fmt(max)}</text>`;
+  s+=`<line class="bl-axis" x1="${PL}" x2="${W}" y1="${H+.5}" y2="${H+.5}"/></svg>`;
+  host.innerHTML=s;
+  host.querySelectorAll('rect').forEach((r,i)=>bindTip(r,
+    `<b>${fmtEdge(edges[i])} – ${i+1<edges.length?fmtEdge(edges[i+1]):'∞'}</b>`+
+    `<div class="r"><i>turns</i><b>${fmt(counts[i])}</b></div>`+
+    `<div class="r"><i>share</i><b>${p1(pct(counts[i],tot))}</b></div>`));
+}
+const tokLbl = v => v>=1000?(v/1000)+'k':String(v);
+
+function drawThinking(A){
+  const hot=A.TH.slice(1), tot=A.TH.reduce((a,b)=>a+b,0);
+  const hotN=hot.reduce((a,b)=>a+b,0);
+  document.getElementById('think-meta').textContent = tot
+    ? p1(pct(hotN,tot))+' of '+fmt(tot)+' turns think' : 'no turns';
+  histBars(document.getElementById('think-hist'), hot, C.thinkEdges.slice(1),
+           'var(--s7)', tokLbl);
+  const shareThink = A.turnSecs ? A.thinkTok/Math.max(A.turnOut,1) : 0;
+  document.getElementById('think-stats').innerHTML=
+    '<div class="latstat"><span class="k">turns thinking</span><span class="v">'+
+      p1(pct(hotN,tot))+'</span></div>'+
+    '<div class="latstat"><span class="k">thinking tokens</span><span class="v">'+
+      fmt(A.thinkTok)+'</span></div>'+
+    '<div class="latstat"><span class="k">share of output</span><span class="v">'+
+      p1(100*shareThink)+'</span></div>'+
+    '<div class="latstat"><span class="k">cache 1h share</span><span class="v">'+
+      p1(pct(A.c1h,A.c5m+A.c1h))+'</span></div>';
+}
+
+function drawTransitions(A){
+  const idx=C.tools.map((t,i)=>i)
+    .filter(i=>A.T[i].n>0)
+    .sort((a,b)=>A.T[b].n-A.T[a].n).slice(0,8);
+  const meta=document.getElementById('trans-meta');
+  const host=document.getElementById('trans-heat');
+  const tot=A.trans.reduce((a,row)=>a+row.reduce((x,y)=>x+y,0),0);
+  if(!idx.length||!tot){ host.innerHTML='<div class="empty">No transitions.</div>';
+    meta.textContent=''; return; }
+  let mx=0; idx.forEach(a=>idx.forEach(b=>{ mx=Math.max(mx,A.trans[a][b]); }));
+  const N=idx.length, CELL=34, PL=104, PT=54, W=PL+N*CELL+8;
+  let s=`<svg viewBox="0 0 ${W} ${PT+N*CELL+8}" role="img" aria-label="Tool transition matrix">`;
+  idx.forEach((b,j)=>{
+    const x=PL+j*CELL+CELL/2;
+    s+=`<text class="ax" transform="rotate(-45 ${x} ${PT-8})" x="${x}" y="${PT-8}" text-anchor="start" style="font-size:9.5px">${esc(C.tools[b].n).slice(0,11)}</text>`;
+  });
+  idx.forEach((a,i)=>{
+    s+=`<text class="ax" x="${PL-7}" y="${PT+i*CELL+CELL/2+3.5}" text-anchor="end" style="font-size:10px;fill:var(--ink-2)">${esc(C.tools[a].n).slice(0,14)}</text>`;
+    idx.forEach((b,j)=>{
+      const v=A.trans[a][b];
+      // colour on a log scale, and label on the same scale - a linear label
+      // threshold leaves every cell but the peak unlabelled.
+      const si=v? Math.min(RAMP.length-1, Math.floor(Math.log(1+v)/Math.log(1+mx)*RAMP.length)) : -1;
+      s+=`<rect data-a="${a}" data-b="${b}" x="${PL+j*CELL+1}" y="${PT+i*CELL+1}" width="${CELL-2}" height="${CELL-2}" fill="${si<0?'var(--sunken)':RAMP[si]}" rx="2"/>`;
+      if(v){
+        const lbl = v>=10000?(v/1000).toFixed(0)+'k' : v>=1000?(v/1000).toFixed(1)+'k' : String(v);
+        s+=`<text x="${PL+j*CELL+CELL/2}" y="${PT+i*CELL+CELL/2+3.5}" text-anchor="middle" style="font-family:var(--mono);font-size:8.5px;fill:${si>=4?'#fff':'#0b0b0b'}">${lbl}</text>`;
+      }
+    });
+  });
+  s+='</svg>';
+  host.innerHTML=s;
+  meta.textContent=fmt(tot)+' transitions';
+  host.querySelectorAll('rect[data-a]').forEach(r=>{
+    const a=+r.dataset.a, b=+r.dataset.b, v=A.trans[a][b];
+    bindTip(r,`<b>${esc(C.tools[a].n)} → ${esc(C.tools[b].n)}</b>`+
+      `<div class="r"><i>times</i><b>${fmt(v)}</b></div>`+
+      `<div class="r"><i>of all</i><b>${p1(pct(v,tot))}</b></div>`);
+  });
+  const rec=A.rec, rtot=rec.reduce((a,b)=>a+b,0);
+  document.getElementById('recovery').innerHTML = rtot
+    ? '<div class="comp" style="height:26px">'+
+      [[0,'same tool, recovered','--s3'],[1,'other tool, recovered','--s1'],
+       [2,'same tool, failed again','--s2'],[3,'other tool, failed again','--s8']]
+      .filter(([i])=>rec[i]).map(([i,lbl,col])=>
+        '<span title="'+lbl+'" style="flex:'+rec[i]+';background:var('+col+')">'+
+        (rec[i]/rtot>0.12?p1(pct(rec[i],rtot)):'')+'</span>').join('')+'</div>'+
+      '<div class="lgi" style="font-size:12.5px;color:var(--ink-2)">After a failed call, <b>'+
+      p1(pct(rec[0]+rec[1],rtot))+'</b> recover on the very next one ('+fmt(rtot)+' cases)</div>'
+    : '';
+}
+
+function drawChurn(A){
+  const rows=C.exts.map((x,i)=>({x, a:A.CH[i][0], r:A.CH[i][1], n:A.CH[i][2]}))
+    .filter(r=>r.a+r.r).sort((a,b)=>(b.a+b.r)-(a.a+a.r)).slice(0,10);
+  const add=rows.reduce((s,r)=>s+r.a,0), rem=rows.reduce((s,r)=>s+r.r,0);
+  const edits=rows.reduce((s,r)=>s+r.n,0);
+  document.getElementById('note-churn').textContent=C.copy.churn;
+  document.getElementById('churn-meta').textContent=edits?fmt(edits)+' edits with a diff':'no diffs';
+  barList(document.getElementById('churn'), rows.map(r=>({
+    label:r.x, v:r.a, v2:r.r, color:'var(--s3)', color2:'var(--s8)',
+    right:'+'+fmt(r.a)+' <i>−'+fmt(r.r)+'</i>',
+    tip:'<b>'+esc(r.x)+'</b><div class="r"><i>edits</i><b>'+fmt(r.n)+'</b></div>'+
+      '<div class="r"><i>added</i><b>'+fmt(r.a)+'</b></div>'+
+      '<div class="r"><i>removed</i><b>'+fmt(r.r)+'</b></div>'
+  })));
+  document.getElementById('churn-legend').innerHTML=
+    '<span class="lgi"><span class="sw" style="background:var(--s3)"></span>added <b>'+fmt(add)+'</b></span>'+
+    '<span class="lgi"><span class="sw" style="background:var(--s8)"></span>removed <b>'+fmt(rem)+'</b></span>'+
+    (rem?'<span class="lgi" style="color:var(--muted)">'+(add/rem).toFixed(1)+':1 add to remove</span>':'');
+}
+
+function drawYou(A){
+  const [enq,deq,rem]=A.Q;
+  document.getElementById('you-meta').textContent = enq? fmt(enq)+' messages queued' : '';
+  document.getElementById('queue-funnel').innerHTML = enq
+    ? '<div class="comp" style="height:30px">'+
+      '<span style="flex:'+Math.max(deq,1)+';background:var(--s1)">'+(deq/enq>0.15?fmt(deq)+' ran':'')+'</span>'+
+      '<span style="flex:'+Math.max(rem,1)+';background:var(--s2)">'+(rem/enq>0.15?fmt(rem)+' pulled back':'')+'</span>'+
+      '</div><div class="lgi" style="font-size:12.5px;color:var(--ink-2)">You pulled back <b>'+
+      p1(pct(rem,enq))+'</b> of what you queued while Claude was working</div>'
+    : '<div class="empty">No queued messages in this selection.</div>';
+  const ph=document.getElementById('prompt-hist');
+  const tot=A.PRM.reduce((a,b)=>a+b,0);
+  if(tot){
+    ph.innerHTML='<div class="eyebrow" style="margin-bottom:7px">typed prompt length · '+
+      fmt(tot)+' prompts</div><div id="prompt-hist-svg"></div>';
+    histBars(document.getElementById('prompt-hist-svg'), A.PRM, C.promptEdges,
+             'var(--s4)', v=>v>=1000?(v/1000)+'k':String(v));
+  } else ph.innerHTML='';
+}
+
 /* ---- render ---- */
 function render(){
   const A=agg();
@@ -1728,6 +2074,10 @@ function render(){
   document.getElementById('web-meta').textContent=wr.length?wr.length+' domains shown':'no web activity';
 
   drawLatency(A);
+  drawThinking(A);
+  drawTransitions(A);
+  drawChurn(A);
+  drawYou(A);
 
   /* hours + exts */
   drawHours(A);
@@ -1851,7 +2201,7 @@ def _table(headers, rows, aligns=None, indent="  "):
     return "\n".join(out) + "\n"
 
 
-def write_report(calls, urls, turns, cube, git_counter, path):
+def write_report(calls, urls, turns, events, cube, git_counter, path):
     live = [r for r in calls if r.get("date")]
     n = len(live)
     pc = lambda a, b: "%.2f%%" % (100.0 * a / b) if b else "—"
@@ -2069,6 +2419,136 @@ payload           : {bi} in / {bo} out
                      % (100.0 * tool_ms / both, 100.0 * model_ms / both,
                         ms(tool_ms), ms(model_ms), ms(human_ms), ms(IDLE_CUTOFF_MS)))
 
+    section("MODEL INTERNALS")
+    think = sorted(t.get("thinking_tokens") or 0 for t in turns)
+    nz = [v for v in think if v]
+    if nz:
+        o.append("  extended thinking fired on %s of %s turns (%.0f%%)\n"
+                 "  thinking tokens when it does: p50 %s · p90 %s · p99 %s · max %s\n"
+                 % (fmt_int(len(nz)), fmt_int(len(think)), 100.0 * len(nz) / len(think),
+                    fmt_int(pctl(nz, .5)), fmt_int(pctl(nz, .9)),
+                    fmt_int(pctl(nz, .99)), fmt_int(nz[-1])))
+        rows = []
+        by_model = defaultdict(list)
+        for t in turns:
+            by_model[t.get("model") or "?"].append(t)
+        for mdl, ts_ in sorted(by_model.items(), key=lambda x: -len(x[1])):
+            v = sorted(t.get("thinking_tokens") or 0 for t in ts_)
+            hot = [x for x in v if x]
+            lat_hot = sorted(t["latency_ms"] for t in ts_
+                             if t.get("thinking_tokens") and t.get("latency_ms")
+                             and not t.get("idle"))
+            lat_cold = sorted(t["latency_ms"] for t in ts_
+                              if not t.get("thinking_tokens") and t.get("latency_ms")
+                              and not t.get("idle"))
+            rows.append([mdl, fmt_int(len(v)), "%.0f%%" % (100.0 * len(hot) / len(v)) if v else "—",
+                         fmt_int(pctl(hot, .5) or 0), fmt_int(pctl(hot, .95) or 0),
+                         ms(pctl(lat_hot, .5)), ms(pctl(lat_cold, .5))])
+        o.append(_table(["model", "turns", "thinks", "p50 tok", "p95 tok",
+                         "p50 lat thinking", "p50 lat not"], rows))
+    c5 = sum(t.get("cache_5m_tokens") or 0 for t in turns)
+    c1 = sum(t.get("cache_1h_tokens") or 0 for t in turns)
+    if c5 or c1:
+        o.append("\n  prompt cache writes by TTL: %s at 5 min · %s at 1 hour (%.0f%% long-lived)\n"
+                 % (fmt_int(c5), fmt_int(c1), 100.0 * c1 / (c5 + c1)))
+    sub = Counter(r["resolved_model"] for r in live if r.get("resolved_model"))
+    if sub:
+        o.append("\n  model each subagent actually ran on\n")
+        o.append(_table(["model", "subagents"], [[k, fmt_int(v)] for k, v in sub.most_common()]))
+
+    section("WORKFLOW SHAPE")
+    by_session = defaultdict(list)
+    for r in live:
+        by_session[r["session_id"]].append(r)
+    trans, rec = Counter(), Counter()
+    for rows_ in by_session.values():
+        rows_.sort(key=lambda r: r["ts_ms"] or 0)
+        for a, b in zip(rows_, rows_[1:]):
+            trans[(a["tool_name"], b["tool_name"])] += 1
+            if a["is_error"]:
+                rec[("same tool" if a["tool_name"] == b["tool_name"] else "different tool",
+                     "recovered" if not b["is_error"] else "failed again")] += 1
+    if trans:
+        tot = sum(trans.values())
+        o.append("  %s transitions across %s distinct tool pairs\n" % (fmt_int(tot), len(trans)))
+        o.append(_table(["from", "to", "n", "share"],
+                        [[a, b, fmt_int(n), "%.1f%%" % (100.0 * n / tot)]
+                         for (a, b), n in trans.most_common(15)],
+                        aligns=["<", "<", ">", ">"]))
+        rep = sum(n for (a, b), n in trans.items() if a == b)
+        o.append("\n  %.0f%% of transitions repeat the same tool - work arrives in runs, "
+                 "not alternation\n" % (100.0 * rep / tot))
+    if rec:
+        tot = sum(rec.values())
+        ok = sum(n for k, n in rec.items() if k[1] == "recovered")
+        o.append("\n  what happens on the call after a failure (%s cases, %.0f%% recover)\n"
+                 % (fmt_int(tot), 100.0 * ok / tot))
+        o.append(_table(["next call", "outcome", "n"],
+                        [[k[0], k[1], fmt_int(v)] for k, v in rec.most_common()],
+                        aligns=["<", "<", ">"]))
+
+    churn = [r for r in live if r.get("lines_added") is not None]
+    if churn:
+        add = sum(r["lines_added"] for r in churn)
+        rem = sum(r["lines_removed"] for r in churn)
+        writes = sum(1 for r in live if r["tool_category"] == "file_write")
+        section("CODE CHURN")
+        o.append("  %s lines added · %s removed (%.1f:1) across %s edits that carried a diff\n"
+                 "  that is %.0f%% of %s file-write calls - creating a new file produces no patch\n"
+                 % (fmt_int(add), fmt_int(rem), add / rem if rem else 0, fmt_int(len(churn)),
+                    100.0 * len(churn) / writes if writes else 0, fmt_int(writes)))
+        ext = defaultdict(lambda: [0, 0, 0])
+        for r in churn:
+            cell = ext[r["file_ext"] or "(none)"]
+            cell[0] += r["lines_added"]
+            cell[1] += r["lines_removed"]
+            cell[2] += 1
+        o.append(_table(["ext", "edits", "added", "removed", "net"],
+                        [[k, fmt_int(v[2]), fmt_int(v[0]), fmt_int(v[1]),
+                          "%+d" % (v[0] - v[1])]
+                         for k, v in sorted(ext.items(), key=lambda x: -(x[1][0] + x[1][1]))[:12]]))
+        sz = sorted(r["lines_added"] + r["lines_removed"] for r in churn)
+        o.append("\n  edit size: p50 %s lines · p90 %s · p99 %s · max %s\n"
+                 % (pctl(sz, .5), pctl(sz, .9), pctl(sz, .99), sz[-1]))
+
+    q = Counter(e["value"] for e in events if e["kind"] == "queue")
+    prompts = sorted(int(e["value"]) for e in events if e["kind"] == "prompt")
+    comp = [e for e in events if e["kind"] == "compact"]
+    if q or prompts or comp:
+        section("YOUR SIDE OF THE KEYBOARD")
+        if q:
+            enq = q.get("enqueue", 0)
+            o.append("  queued while Claude was working: %s enqueued · %s dequeued · %s removed\n"
+                     % (fmt_int(enq), fmt_int(q.get("dequeue", 0)), fmt_int(q.get("remove", 0))))
+            if enq:
+                o.append("  %.0f%% of queued messages were pulled back before they ran\n"
+                         % (100.0 * q.get("remove", 0) / enq))
+        if prompts:
+            o.append("\n  typed prompt length in characters - pasted material counts, but\n"
+                     "  harness-injected user turns (task notifications, monitor events) do not.\n"
+                     "  The `last-prompt` records are truncated at 201 chars and are unused.\n"
+                     "  n %s · p50 %s · p90 %s · p99 %s · max %s\n"
+                     % (fmt_int(len(prompts)), fmt_int(pctl(prompts, .5)),
+                        fmt_int(pctl(prompts, .9)), fmt_int(pctl(prompts, .99)),
+                        fmt_int(prompts[-1])))
+        if comp:
+            pres = sorted(int(str(e["value"]).split(":")[-1] or 0) for e in comp)
+            trg = Counter(str(e["value"]).split(":")[0] for e in comp)
+            o.append("\n  context compaction fired %s times (%s); context at compaction: "
+                     "p50 %s tokens, max %s\n"
+                     % (fmt_int(len(comp)), ", ".join("%s %s" % (v, k) for k, v in trg.items()),
+                        fmt_int(pctl(pres, .5)), fmt_int(pres[-1])))
+        latest = {}
+        for e in events:
+            if e["kind"] == "title" and e.get("value"):
+                latest[e["session_id"]] = e["value"]
+        if latest:
+            o.append("\n  %s sessions carry an auto-generated title; a sample:\n"
+                     % fmt_int(len(latest)))
+            for v in list(dict.fromkeys(latest.values()))[-8:]:
+                o.append("    · %s" % str(v)[:70])
+            o.append("")
+
     section("WEB")
     if urls:
         ws = [u for u in urls if u["source"] == "WebSearch"]
@@ -2170,6 +2650,7 @@ CALL_COLUMNS = [
     "bash_command", "bash_primary", "bash_bins", "bash_heredoc",
     "file_path", "file_ext", "url", "query", "subagent_type", "skill_name",
     "is_error", "error_kind", "error_group", "error_text",
+    "lines_added", "lines_removed", "resolved_model",
 ]
 URL_COLUMNS = ["source", "url", "domain", "title", "query", "project",
                "session_id", "ts", "date", "tool_use_id"]
@@ -2179,6 +2660,7 @@ TURN_COLUMNS = [
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
     "cache_hit_ratio", "stop_reason", "service_tier", "speed",
     "is_sidechain", "entrypoint", "blocks", "tool_uses", "thinking", "idle",
+    "thinking_tokens", "cache_5m_tokens", "cache_1h_tokens",
 ]
 
 
@@ -2214,14 +2696,15 @@ def main(argv=None):
         return 2
     say("Reading %s transcripts from %s" % (fmt_int(len(files)), root))
 
-    calls, urls, turns = [], [], []
+    calls, urls, turns, events = [], [], [], []
     payload = [(f, root) for f in files]
 
     def collect(results):
-        for c, u, t in results:
+        for c, u, t, e in results:
             calls.extend(c)
             urls.extend(u)
             turns.extend(t)
+            events.extend(e)
 
     if a.jobs > 1 and len(files) > 4:
         try:
@@ -2229,7 +2712,7 @@ def main(argv=None):
                 collect(ex.map(parse_transcript, payload, chunksize=8))
         except Exception as e:                       # sandboxes without fork/sem support
             say("  parallel parse unavailable (%s); falling back to one process" % e)
-            calls, urls, turns = [], [], []
+            calls, urls, turns, events = [], [], [], []
             collect(parse_transcript(i) for i in payload)
     else:
         collect(parse_transcript(i) for i in payload)
@@ -2296,11 +2779,11 @@ def main(argv=None):
                 git[m.group(1)] += 1
 
     if a.redact:
-        calls, urls, turns = redact_rows(calls, urls, turns)
+        calls, urls, turns, events = redact_rows(calls, urls, turns, events)
         say("  redacted: paths, commands, queries, URLs and project names removed")
 
     os.makedirs(a.out, exist_ok=True)
-    cube = build_cube(calls, urls, turns, git, redacted=a.redact)
+    cube = build_cube(calls, urls, turns, events, git, redacted=a.redact)
     written = []
 
     if not a.no_tables:
@@ -2313,7 +2796,7 @@ def main(argv=None):
                                        TURN_COLUMNS, want_parquet=not a.csv))
 
     report_path = os.path.join(a.out, "report.txt")
-    text = write_report(calls, urls, turns, cube, git, report_path)
+    text = write_report(calls, urls, turns, events, cube, git, report_path)
     written.append(report_path)
 
     dash = None
