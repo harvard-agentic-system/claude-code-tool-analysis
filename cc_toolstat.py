@@ -928,7 +928,11 @@ def shorten_projects(keys):
         base[k] = parts[0]
         tail[k] = parts[1] if len(parts) > 1 else None
 
-    segs = {k: [s for s in b.lstrip("-").split("-") if s] or [k] for k, b in base.items()}
+    # Claude encodes the cwd with '-' separators; Codex and Grok record real
+    # paths. Split on whichever separator the key actually uses.
+    sep = {k: ("/" if "/" in b else "-") for k, b in base.items()}
+    segs = {k: [s for s in b.strip("-/").split(sep[k]) if s] or [k]
+            for k, b in base.items()}
     uniq = {tuple(v) for v in segs.values()}
     n = len(uniq)
     freq = Counter()
@@ -948,7 +952,8 @@ def shorten_projects(keys):
                 last_boiler = idx
             elif idx - last_boiler > 1:             # two non-boilerplate in a row: name starts
                 break
-        name = "-".join(parts[last_boiler + 1:]) or "-".join(parts)
+        j = sep[key]
+        name = j.join(parts[last_boiler + 1:]) or j.join(parts)
         labels[key] = (name + " \u2442 " + tail[key]) if tail[key] else (name or key)
     return labels
 
@@ -1552,7 +1557,9 @@ a{color:var(--s1)}
   border:1px solid var(--rule);background:transparent;color:var(--ink-2)}
 .btn:hover{border-color:var(--axis);color:var(--ink)}
 .btn[aria-pressed="true"]{background:var(--ink);border-color:var(--ink);color:var(--plane)}
-.scope{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-left:auto;white-space:nowrap}
+.scope{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-left:auto;
+  white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
+@media (max-width:720px){.scope{margin-left:0;white-space:normal;flex-basis:100%}}
 .scope b{color:var(--ink);font-weight:500}
 
 /* ---------- kpi strip ---------- */
@@ -1601,6 +1608,14 @@ a{color:var(--s1)}
 .lgi .sw{width:11px;height:11px;border-radius:2px;flex:0 0 auto}
 .lgi b{font-family:var(--mono);font-weight:500;color:var(--ink);font-variant-numeric:tabular-nums}
 
+.atabs{display:flex;gap:2px;margin:0 0 12px;border-bottom:1px solid var(--rule);flex-wrap:wrap}
+.atab{font-family:var(--mono);font-size:13px;padding:8px 14px 9px;cursor:pointer;background:none;
+  border:none;border-bottom:2px solid transparent;color:var(--muted);margin-bottom:-1px;
+  display:flex;align-items:baseline;gap:7px;transition:color .12s}
+.atab:hover{color:var(--ink)}
+.atab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--s1);font-weight:600}
+.atab .an{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.atab[aria-selected="true"] .an{color:var(--s1)}
 .lat-switch{display:flex;gap:5px;margin:0 0 16px}
 .latgrid{display:grid;grid-template-columns:1fr 214px;gap:22px;align-items:start}
 @media (max-width:760px){.latgrid{grid-template-columns:1fr}}
@@ -1676,10 +1691,7 @@ tr:hover td{background:var(--rule-2)}
   </header>
 
   <div class="rail">
-    <div class="rail-row" id="agent-row" style="margin-bottom:9px" hidden>
-      <span class="rail-lbl">Agent</span>
-      <div class="chips" id="agent-chips"></div>
-    </div>
+    <div class="atabs" id="agent-tabs" role="tablist" hidden></div>
     <div class="rail-row" style="margin-bottom:9px">
       <span class="rail-lbl">Project</span>
       <div class="chips" id="chips"></div>
@@ -1949,7 +1961,7 @@ function barList(host, rows, opts){
   const o = opts||{};
   host.innerHTML='';
   if(!rows.length){ host.innerHTML='<div class="empty">No calls in this selection.</div>'; return; }
-  const max = Math.max(...rows.map(r=>r.v), 1);
+  const max = Math.max(...rows.map(r=>r.v + (r.v2 || 0)), 1);
   for(const r of rows){
     const el=document.createElement('div'); el.className='bar';
     const w = Math.max(0.6, 100*r.v/max);
@@ -2400,10 +2412,11 @@ function render(){
   setText('thesis',C.copy.thesis); setText('note-timeline',C.copy.timeline);
   setText('note-tools',C.copy.tools); setText('note-bash',C.copy.bash);
   const real=A.e-A.notReal;
-  const agOn=AG.length>1 ? [...new Set([...sel].map(i=>C.projects[i].a))]
-      .map(i=>AG[i].n).join(' + ')+' · ' : '';
+  const ps=pool();
+  const agOn=AG.length>1 ? (activeAgent<0?'all agents':AG[activeAgent].n)+' · ' : '';
   document.getElementById('scope').innerHTML= agOn+
-    (sel.size===nP?'all projects':sel.size+' of '+nP+' projects')+
+    (ps.every(p=>sel.has(p))?ps.length+(ps.length===1?' project':' projects')
+                            :sel.size+' of '+ps.length+' projects')+
     ' · <b>'+C.dates[d0]+'</b> → <b>'+C.dates[d1]+'</b> · '+(d1-d0+1)+' days';
   document.getElementById('window').innerHTML=
     '<b>'+fmt(C.meta.totalCalls)+'</b> tool calls<br><b>'+fmt(C.meta.transcripts)+'</b> transcripts · <b>'+
@@ -2546,51 +2559,53 @@ if(!C.git.length){ const g=document.getElementById('tab-git'); if(g) g.remove();
 /* ---- controls ---- */
 const projTotals=C.projects.map(()=>0);
 for(const [d,p,t,n] of C.A) projTotals[p]+=n;
-/* agent chips select every project belonging to that agent */
+/* Agent is the top-level scope: one tab per discovered agent, plus an
+   all-agents tab. Project chips below are scoped to the active tab. */
 const AG=C.agents||[];
+const projOf=a=>C.projects.map((p,i)=>[p,i]).filter(([p])=>p.a===a).map(([,i])=>i);
+const callsOf=idx=>{ let n=0; for(const [d,p,,cn] of C.A) if(idx.has(p)) n+=cn; return n; };
+let activeAgent=-1;                       /* -1 = all agents */
+
 if(AG.length>1){
-  const row=document.getElementById('agent-row'); row.hidden=false;
-  const projOf=a=>C.projects.map((p,i)=>[p,i]).filter(([p])=>p.a===a).map(([,i])=>i);
-  document.getElementById('agent-chips').innerHTML=AG.map((a,i)=>{
-    const n=projOf(i).length;
-    return '<button class="chip" data-ag="'+i+'" aria-pressed="true">'+esc(a.n)+
-      '<span class="cn">'+n+'</span></button>';}).join('');
-  document.getElementById('agent-chips').addEventListener('click',e=>{
+  const tabs=document.getElementById('agent-tabs');
+  tabs.hidden=false;
+  const mk=(i,label,idx)=>'<button class="atab" role="tab" data-ag="'+i+'" aria-selected="'+
+    (i===activeAgent)+'"><span>'+esc(label)+'</span><span class="an">'+
+    fmt(callsOf(new Set(idx)))+'</span></button>';
+  tabs.innerHTML=mk(-1,'All agents',C.projects.map((_,i)=>i))+
+    AG.map((a,i)=>mk(i,a.n,projOf(i))).join('');
+  tabs.addEventListener('click',e=>{
     const b=e.target.closest('[data-ag]'); if(!b) return;
-    const i=+b.dataset.ag, mine=projOf(i);
-    const allOn=AG.every((_,j)=>projOf(j).every(p=>sel.has(p)));
-    if(allOn) sel=new Set(mine);
-    else if(mine.every(p=>sel.has(p))){ mine.forEach(p=>sel.delete(p));
-      if(!sel.size) sel=new Set(C.projects.map((_,j)=>j)); }
-    else mine.forEach(p=>sel.add(p));
-    syncAgents(); drawChips(); render();
+    activeAgent=+b.dataset.ag;
+    sel=new Set(activeAgent<0 ? C.projects.map((_,i)=>i) : projOf(activeAgent));
+    chipsOpen=false; syncAgents(); drawChips(); render();
   });
 }
 function syncAgents(){
-  if(AG.length<2) return;
-  const projOf=a=>C.projects.map((p,i)=>[p,i]).filter(([p])=>p.a===a).map(([,i])=>i);
-  document.querySelectorAll('[data-ag]').forEach(b=>{
-    const mine=projOf(+b.dataset.ag);
-    b.setAttribute('aria-pressed', mine.some(p=>sel.has(p))?'true':'false');
-  });
+  document.querySelectorAll('[data-ag]').forEach(b=>
+    b.setAttribute('aria-selected', (+b.dataset.ag===activeAgent)?'true':'false'));
 }
 const SHOWN=10; let chipsOpen=false;
+function pool(){ return activeAgent<0 ? C.projects.map((_,i)=>i) : projOf(activeAgent); }
 function chipHTML(i){const p=C.projects[i];
-  return '<button class="chip" data-p="'+i+'" aria-pressed="true" title="'+esc(p.k)+'">'+esc(p.n)+
-  '<span class="cn">'+(projTotals[i]>=1000?(projTotals[i]/1000).toFixed(1)+'k':projTotals[i])+'</span></button>';}
+  return '<button class="chip" data-p="'+i+'" aria-pressed="true" title="'+esc(p.k||p.n)+'">'+
+  esc(p.n)+'<span class="cn">'+(projTotals[i]>=1000?(projTotals[i]/1000).toFixed(1)+'k':projTotals[i])+
+  '</span></button>';}
 function drawChips(){
-  const n=chipsOpen?nP:Math.min(SHOWN,nP);
-  let h=C.projects.slice(0,n).map((_,i)=>chipHTML(i)).join('');
-  if(nP>SHOWN) h+='<button class="btn" id="more">'+(chipsOpen?'fewer':'+'+(nP-SHOWN)+' smaller')+'</button>';
-  document.getElementById('chips').innerHTML=h; syncChips(); syncAgents();
+  const ps=pool();
+  const n=chipsOpen?ps.length:Math.min(SHOWN,ps.length);
+  let h=ps.slice(0,n).map(chipHTML).join('');
+  if(ps.length>SHOWN) h+='<button class="btn" id="more">'+
+    (chipsOpen?'fewer':'+'+(ps.length-SHOWN)+' smaller')+'</button>';
+  document.getElementById('chips').innerHTML=h; syncChips();
 }
 drawChips();
 document.getElementById('chips').addEventListener('click',e=>{
   if(e.target.closest('#more')){ chipsOpen=!chipsOpen; drawChips(); return; }
   const b=e.target.closest('.chip'); if(!b) return;
-  const i=+b.dataset.p;
-  if(sel.size===nP){ sel=new Set([i]); if(i>=SHOWN) chipsOpen=true; }
-  else if(sel.has(i)){ sel.delete(i); if(!sel.size) sel=new Set(C.projects.map((_,j)=>j)); }
+  const i=+b.dataset.p, ps=pool();
+  if(ps.every(p=>sel.has(p))) sel=new Set([i]);            /* whole scope on -> isolate */
+  else if(sel.has(i)){ sel.delete(i); if(!sel.size) sel=new Set(ps); }
   else sel.add(i);
   drawChips(); render();
 });
@@ -2617,7 +2632,8 @@ document.getElementById('ranges').addEventListener('click',e=>{
   render();
 });
 document.getElementById('reset').addEventListener('click',()=>{
-  sel=new Set(C.projects.map((_,i)=>i)); d0=0; d1=nD-1; chipsOpen=false; drawChips(); render();
+  activeAgent=-1; sel=new Set(C.projects.map((_,i)=>i)); d0=0; d1=nD-1; chipsOpen=false;
+  syncAgents(); drawChips(); render();
 });
 document.getElementById('tabs').addEventListener('click',e=>{
   const b=e.target.closest('.tab'); if(!b) return;

@@ -18,8 +18,9 @@ python3 cc_toolstat.py --open          # analyse everything it found
 | Codex | `~/.codex/sessions/**/rollout-*.jsonl` | tool durations are dispatch-only (see below) |
 | Grok | `~/.grok/sessions/**/updates.jsonl` | tool timestamps are whole seconds |
 
-Every row in every table carries an `agent` column, and the dashboard gets an agent filter,
-so you can compare corpora or isolate one.
+Every row in every table carries an `agent` column, and the dashboard opens with one tab per
+discovered agent (plus an all-agents tab), so you can compare corpora or isolate one. Project
+chips are scoped to the active tab. With only one agent present the tab strip is hidden.
 
 ## What it answers
 
