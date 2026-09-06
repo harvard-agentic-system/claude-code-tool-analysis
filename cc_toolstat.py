@@ -121,6 +121,7 @@ SHELL_KW = {
     "if", "then", "else", "elif", "fi", "for", "do", "done", "while", "until", "case",
     "esac", "in", "function", "cd", "set", "export", "local", "return", "source", ".",
     "eval", "trap", "shift", "read", "declare", "unset", "alias",
+    "break", "continue", "fg", "bg",
 }
 
 
@@ -219,7 +220,7 @@ def category_of(name):
 
 
 def parse_transcript(args):
-    """Worker: parse one .jsonl transcript into (calls, urls). Never raises."""
+    """Worker: parse one transcript into (calls, urls, turns). Never raises."""
     path, root = args
     try:
         rel = os.path.relpath(path, root)
@@ -229,10 +230,15 @@ def parse_transcript(args):
     project = parts[0] if len(parts) > 1 else "(root)"
     from_subagent = "subagents" in parts
     calls, urls, pending = [], [], {}
+    # One API call is written as several transcript lines - one per content
+    # block - all sharing a requestId and repeating the same usage totals. So
+    # group by requestId rather than treating each line as an inference.
+    turns, order = {}, []
+    human_ts = machine_ts = None
     try:
         fh = open(path, errors="replace")
     except OSError:
-        return [], []
+        return [], [], []
     with fh:
         for line in fh:
             line = line.strip()
@@ -249,6 +255,49 @@ def parse_transcript(args):
             if not isinstance(content, list):
                 continue
             stamp = d.get("timestamp")
+            now = ts_ms(stamp)
+            kinds = {b.get("type") for b in content if isinstance(b, dict)}
+
+            if d.get("type") == "assistant":
+                rid = d.get("requestId")
+                if rid and now:
+                    t = turns.get(rid)
+                    if t is None:
+                        u = msg.get("usage") or {}
+                        trig, kind = _trigger(human_ts, machine_ts)
+                        t = turns[rid] = {
+                            "request_id": rid, "session_id": d.get("sessionId"),
+                            "project": project, "transcript": rel,
+                            "model": msg.get("model"), "ts": stamp,
+                            "trigger_ms": trig, "trigger_kind": kind,
+                            "first_ms": now, "last_ms": now,
+                            "stop_reason": msg.get("stop_reason"),
+                            "input_tokens": u.get("input_tokens") or 0,
+                            "output_tokens": u.get("output_tokens") or 0,
+                            "cache_read_tokens": u.get("cache_read_input_tokens") or 0,
+                            "cache_creation_tokens": u.get("cache_creation_input_tokens") or 0,
+                            "service_tier": u.get("service_tier"),
+                            "speed": u.get("speed"),
+                            "is_sidechain": bool(d.get("isSidechain")) or from_subagent,
+                            "entrypoint": d.get("entrypoint"),
+                            "blocks": 0, "tool_uses": 0, "thinking": False,
+                        }
+                        order.append(rid)
+                    t["last_ms"] = max(t["last_ms"], now)
+                    t["blocks"] += len(content)
+                    t["tool_uses"] += sum(1 for b in content
+                                          if isinstance(b, dict) and b.get("type") == "tool_use")
+                    if "thinking" in kinds:
+                        t["thinking"] = True
+                    if msg.get("stop_reason"):
+                        t["stop_reason"] = msg.get("stop_reason")
+            elif now:
+                # Anything not from the assistant re-arms the trigger clock. A
+                # tool_result or attachment is machine time; a typed prompt is not.
+                if "tool_result" in kinds or d.get("type") == "attachment":
+                    machine_ts = now
+                else:
+                    human_ts = now
             for b in content:
                 if not isinstance(b, dict):
                     continue
@@ -340,7 +389,34 @@ def parse_transcript(args):
                                         "project": project, "session_id": d.get("sessionId"),
                                         "ts": stamp, "tool_use_id": b.get("tool_use_id"),
                                     })
-    return calls, urls
+    for rid in order:
+        t = turns[rid]
+        if t["trigger_ms"] and t["last_ms"] >= t["trigger_ms"]:
+            t["latency_ms"] = t["last_ms"] - t["trigger_ms"]
+            t["ttfb_ms"] = t["first_ms"] - t["trigger_ms"]
+        else:
+            t["latency_ms"] = t["ttfb_ms"] = None
+        t["decode_ms"] = t["last_ms"] - t["first_ms"]
+        lat = t["latency_ms"]
+        t["idle"] = bool(lat and lat > IDLE_CUTOFF_MS)
+        t["output_tps"] = (round(t["output_tokens"] / (lat / 1000.0), 2)
+                           if lat and not t["idle"] else None)
+        cached, fresh = t["cache_read_tokens"], t["cache_creation_tokens"] + t["input_tokens"]
+        t["cache_hit_ratio"] = round(cached / (cached + fresh), 4) if (cached + fresh) else None
+        for k in ("trigger_ms", "first_ms", "last_ms"):
+            t.pop(k)
+    return calls, urls, [turns[r] for r in order]
+
+
+def _trigger(human_ts, machine_ts):
+    """Which event started this inference, and when."""
+    if human_ts and machine_ts:
+        return (machine_ts, "tool_result") if machine_ts >= human_ts else (human_ts, "user")
+    if machine_ts:
+        return machine_ts, "tool_result"
+    if human_ts:
+        return human_ts, "user"
+    return None, None
 
 
 # --------------------------------------------------------------- discovery ---
@@ -425,7 +501,7 @@ def shorten_projects(keys):
     return labels
 
 
-def redact_rows(calls, urls):
+def redact_rows(calls, urls, turns=()):
     """Strip everything that could identify a person, machine or codebase."""
     salt = os.urandom(8).hex()
 
@@ -455,7 +531,58 @@ def redact_rows(calls, urls):
         u["url"] = ""                  # domain is recomputed as "(redacted)"
         u["title"] = None
         u["query"] = None
-    return calls, urls
+    for t in turns:
+        t["project"] = projmap.get(t.get("project"), "project-?")
+        t["session_id"] = h(t.get("session_id"), 10)
+        t["transcript"] = h(t.get("transcript"))
+        t["request_id"] = h(t.get("request_id"), 10)
+    return calls, urls, turns
+
+
+# Log-spaced edges for the latency histogram the dashboard filters on. Exact
+# percentiles go in report.txt; the dashboard interpolates within these buckets.
+# ~1.6x steps: fine enough that interpolating inside a bucket stays close to the
+# exact percentile, cheap enough that the cube stays small.
+LAT_EDGES = [0, 5, 10, 15, 25, 40, 60, 100, 150, 250, 400, 600, 1000, 1500, 2500,
+             4000, 6000, 10000, 15000, 25000, 40000, 60000, 100000, 150000, 250000,
+             400000, 600000, 1000000, 1800000]
+
+# A machine-triggered turn cannot legitimately take ten minutes: gaps that long
+# mean the session was paused, interrupted or resumed, and the wall clock kept
+# running. Such turns are flagged and kept out of latency statistics.
+IDLE_CUTOFF_MS = 600_000
+
+
+def lat_bucket(ms):
+    lo, hi = 0, len(LAT_EDGES)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if LAT_EDGES[mid] <= ms:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo - 1 if lo else 0
+
+
+def pctl(sorted_vals, q):
+    """Nearest-rank percentile on an already-sorted list."""
+    if not sorted_vals:
+        return None
+    k = max(0, min(len(sorted_vals) - 1, int(round(q * (len(sorted_vals) - 1)))))
+    return sorted_vals[k]
+
+
+def ms(v):
+    if v is None:
+        return "—"
+    v = float(v)
+    if v < 1000:
+        return "%d ms" % round(v)
+    if v < 60_000:
+        return "%.1f s" % (v / 1000)
+    if v < 3_600_000:
+        return "%.1f min" % (v / 60_000)
+    return "%.1f h" % (v / 3_600_000)
 
 
 def domain_of(url):
@@ -520,12 +647,14 @@ def topn(counter, n, other="· other"):
     return keys + ([other] if len(counter) > len(keys) else [])
 
 
-def build_cube(calls, urls, git_counter, redacted=False):
+def build_cube(calls, urls, turns, git_counter, redacted=False):
     for r in calls:
         r["date"], r["hour"] = local_parts(r["ts"])
     for u in urls:
         u["date"], _ = local_parts(u["ts"])
         u["domain"] = "(redacted)" if redacted else domain_of(u["url"])
+    for t in turns:
+        t["date"], t["hour"] = local_parts(t["ts"])
 
     live = [r for r in calls if r["date"]]
     dates = sorted({r["date"] for r in live})
@@ -605,6 +734,34 @@ def build_cube(calls, urls, git_counter, redacted=False):
                dmi.get(u["domain"], dmi.get("· other", 0)),
                0 if u["source"] == "WebSearch" else 1)] += 1
 
+    # Latency: a log-bucketed histogram per (date, project, tool) so the
+    # dashboard can recompute percentiles under any filter combination.
+    L = Counter()
+    for r in live:
+        if r["duration_ms"] is not None:
+            L[(di[r["date"]], pi[r["project"]], ti[r["tool_name"]],
+               lat_bucket(r["duration_ms"]))] += 1
+
+    tlive = [t for t in turns if t.get("date") in di and t["project"] in pi]
+    model_n = Counter(t["model"] for t in tlive if t.get("model"))
+    models = [m for m, _ in model_n.most_common()]
+    mi = {v: i for i, v in enumerate(models)}
+    M, N = Counter(), defaultdict(lambda: [0] * 6)
+    for t in tlive:
+        if t.get("model") not in mi:
+            continue
+        d, p, m = di[t["date"]], pi[t["project"]], mi[t["model"]]
+        if (t.get("latency_ms") is not None and t.get("trigger_kind") == "tool_result"
+                and not t.get("idle")):
+            M[(d, p, m, lat_bucket(t["latency_ms"]))] += 1
+            N[(d, p, m)][1] += t["latency_ms"]
+        cell = N[(d, p, m)]
+        cell[0] += 1
+        cell[2] += t.get("output_tokens") or 0
+        cell[3] += t.get("input_tokens") or 0
+        cell[4] += t.get("cache_read_tokens") or 0
+        cell[5] += t.get("cache_creation_tokens") or 0
+
     q_agg = Counter()
     for u in urls:
         if u["source"] == "WebSearch" and u.get("query") and u.get("date") in di:
@@ -638,6 +795,11 @@ def build_cube(calls, urls, git_counter, redacted=False):
         "H": [[q, p, d, n] for (q, p, d), n in q_agg.most_common(400)],
         "I": [[u, p, n] for (u, p), n in f_agg.most_common(150)],
         "J": [[d, p, s, n] for (d, p, s), n in J.items()],
+        "L": [[d, p, t, b, n] for (d, p, t, b), n in L.items()],
+        "M": [[d, p, m, b, n] for (d, p, m, b), n in M.items()],
+        "N": [[d, p, m] + v for (d, p, m), v in N.items()],
+        "models": models,
+        "latEdges": LAT_EDGES,
         "git": git_counter.most_common(12),
     }
     calendar_days = 0
@@ -659,6 +821,14 @@ def build_cube(calls, urls, git_counter, redacted=False):
         "gitInvocations": sum(git_counter.values()),
         "uniqUrls": len({u["url"] for u in urls if u.get("url")}),
         "uniqDomains": len({u["domain"] for u in urls}),
+        "turns": len(tlive),
+        "timedTurns": sum(1 for t in tlive
+                          if t.get("latency_ms") is not None
+                          and t.get("trigger_kind") == "tool_result"
+                          and not t.get("idle")),
+        "idleTurns": sum(1 for t in tlive if t.get("idle")),
+        "idleCutoffMs": IDLE_CUTOFF_MS,
+        "timedCalls": sum(1 for r in live if r["duration_ms"] is not None),
         "activeDays": len(dates),
         "calendarDays": calendar_days,
         "firstDate": dates[0] if dates else "",
@@ -714,6 +884,15 @@ def build_copy(meta, n_err, n_notreal, n_side, n_all, top_cat, top_tool, grp_n, 
                    % (fmt_int(meta["transcripts"]), "your Claude Code data directory",
                       fmt_int(meta["totalCalls"]), fmt_int(meta["totalSessions"]),
                       meta["projects"])),
+        "latTool": ("Wall clock from the tool call being issued to its result landing. It "
+                    "includes the work itself and, where a call needed approval, however long "
+                    "that took — which is why percentiles are shown rather than a mean. "
+                    "Buckets are log-spaced; percentiles interpolate within them."),
+        "latTurn": ("Wall clock from the tool result that triggered an inference to the last "
+                    "block of the model's reply — queue, prefill and decode together. Turns you "
+                    "started by typing are excluded, and so are %s turns whose trigger sat more "
+                    "than %s in the past because the session was paused or resumed."
+                    % (fmt_int(meta.get("idleTurns", 0)), _ms_short(meta.get("idleCutoffMs", 0)))),
         "genuine": ("%s of %s errors (%.0f%%) were the operator’s guardrails or hook transport, "
                     "not a tool defect; the genuine failure rate is %.2f%% of all calls."
                     % (fmt_int(n_notreal), fmt_int(n_err), pc(n_notreal, n_err), pc(real, n_all))
@@ -723,6 +902,10 @@ def build_copy(meta, n_err, n_notreal, n_side, n_all, top_cat, top_tool, grp_n, 
 
 def fmt_int(n):
     return "{:,}".format(int(n))
+
+
+def _ms_short(v):
+    return ms(v) if v else "—"
 
 
 # ---------------------------------------------------------------- dashboard ---
@@ -845,6 +1028,19 @@ a{color:var(--s1)}
 .lgi .sw{width:11px;height:11px;border-radius:2px;flex:0 0 auto}
 .lgi b{font-family:var(--mono);font-weight:500;color:var(--ink);font-variant-numeric:tabular-nums}
 
+.lat-switch{display:flex;gap:5px;margin:0 0 16px}
+.latgrid{display:grid;grid-template-columns:1fr 214px;gap:22px;align-items:start}
+@media (max-width:760px){.latgrid{grid-template-columns:1fr}}
+.latstats{display:flex;flex-direction:column;gap:1px;background:var(--rule);
+  border:1px solid var(--rule)}
+.latstat{background:var(--surface);padding:9px 12px;display:flex;justify-content:space-between;
+  align-items:baseline;gap:10px}
+.latstat .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--muted)}
+.latstat .v{font-family:var(--mono);font-size:15px;font-weight:600;color:var(--ink);
+  font-variant-numeric:tabular-nums}
+.latstat.hi .v{color:var(--critical)}
+
 /* ---------- svg timeline ---------- */
 .tlwrap{position:relative;user-select:none;touch-action:pan-y}
 svg{display:block;width:100%;height:auto;overflow:visible}
@@ -946,6 +1142,26 @@ tr:hover td{background:var(--rule-2)}
       <div class="bars" id="fail-kinds" style="--lw:132px;--vw:64px;margin-top:18px"></div>
     </section>
   </div>
+
+
+  <section class="panel">
+    <div class="phead">
+      <h2>Latency</h2>
+      <span class="pmeta" id="lat-meta"></span>
+    </div>
+    <p class="pnote" id="note-lat"></p>
+    <div class="lat-switch" role="tablist">
+      <button class="btn" data-lat="tool" aria-pressed="true">Tool calls</button>
+      <button class="btn" data-lat="turn" aria-pressed="false">Model turns</button>
+    </div>
+    <div class="latgrid">
+      <div>
+        <div id="lat-hist"></div>
+      </div>
+      <div class="latstats" id="lat-stats"></div>
+    </div>
+    <div class="bars" id="lat-bars" style="--lw:118px;--vw:118px;margin-top:20px"></div>
+  </section>
 
   <div class="grid2">
     <section class="panel">
@@ -1063,10 +1279,23 @@ function agg(){
   for (const [s,d,p] of C.G){ if(inF(d,p)) S.add(s); }
   let side=0, main=0;
   for (const [d,p,is,cn] of C.J){ if(!inF(d,p)) continue; if(is) side+=cn; else main+=cn; }
+  const NB=C.latEdges.length;
+  const LT=new Array(NB).fill(0), LM=new Array(NB).fill(0);
+  const LTby=C.tools.map(()=>new Array(NB).fill(0));
+  const LMby=(C.models||[]).map(()=>new Array(NB).fill(0));
+  for (const [d,p,t,b,cn] of (C.L||[])){ if(!inF(d,p)) continue; LT[b]+=cn; LTby[t][b]+=cn; }
+  for (const [d,p,m,b,cn] of (C.M||[])){ if(!inF(d,p)) continue; LM[b]+=cn; LMby[m][b]+=cn; }
+  let turnN=0, turnLat=0, turnOut=0, turnIn=0, cacheRead=0, cacheCreate=0;
+  for (const [d,p,m,n,lat,out,inp,cr,cc] of (C.N||[])){
+    if(!inF(d,p)) continue;
+    turnN+=n; turnLat+=lat; turnOut+=out; turnIn+=inp; cacheRead+=cr; cacheCreate+=cc;
+  }
   let bashCalls=0, bashErr=0;
   C.tools.forEach((t,i)=>{ if(t.n==='Bash'){bashCalls=T[i].n; bashErr=T[i].e;} });
   const notReal = GRPS.filter(g=>NOTREAL.has(g)).reduce((a,g)=>a+G[g],0);
-  return {T,cat,daily,n,e,ob,ib,ds,dn,K,G,H,B,W,X,sessions:S.size,side,main,bashCalls,bashErr,notReal};
+  return {T,cat,daily,n,e,ob,ib,ds,dn,K,G,H,B,W,X,sessions:S.size,side,main,bashCalls,bashErr,
+          notReal, LT,LM,LTby,LMby, turnN, turnSecs:turnLat/1000, turnOut,
+          cacheRead, cacheFresh:cacheCreate+turnIn};
 }
 
 /* ---- tooltip ---- */
@@ -1272,6 +1501,135 @@ const pill = (c,l) => '<span class="pill" style="background:var(--sunken);color:
 const pillG = g => '<span class="pill" style="background:var(--sunken);color:var(--ink-2)">'+
   '<span class="dot" style="background:var('+GRPCOL[g]+')"></span>'+(GRPLBL[g]||g)+'</span>';
 
+
+/* ---- latency ---- */
+let latMode='tool';
+function histPctl(counts, q){
+  const E=C.latEdges, tot=counts.reduce((a,b)=>a+b,0);
+  if(!tot) return null;
+  const target=q*tot; let acc=0;
+  for(let i=0;i<counts.length;i++){
+    if(acc+counts[i]>=target){
+      const lo=E[i], hi=(i+1<E.length)?E[i+1]:E[E.length-1]*2;
+      return lo+(hi-lo)*(counts[i]?(target-acc)/counts[i]:0);
+    }
+    acc+=counts[i];
+  }
+  return E[E.length-1];
+}
+const msf = v => v==null ? '—'
+  : v<1000 ? Math.round(v)+' ms'
+  : v<60000 ? (v/1000).toFixed(1)+' s'
+  : v<3600000 ? (v/60000).toFixed(1)+' min' : (v/3600000).toFixed(1)+' h';
+const edgeLbl = v => {
+  if(v===0) return '0';
+  if(v<1000) return v+'ms';
+  if(v<60000){ const s=v/1000; return (s<10?+s.toFixed(1):Math.round(s))+'s'; }
+  if(v<3600000){ const m=v/60000; return (m<10?+m.toFixed(1):Math.round(m))+'m'; }
+  return +(v/3600000).toFixed(1)+'h';
+};
+
+function drawLatency(A){
+  const isTool = latMode==='tool';
+  const counts = isTool ? A.LT : A.LM;
+  const tot = counts.reduce((a,b)=>a+b,0);
+  document.getElementById('note-lat').textContent = isTool ? C.copy.latTool : C.copy.latTurn;
+  document.getElementById('lat-meta').textContent = tot
+    ? fmt(tot)+(isTool?' timed calls':' machine-triggered turns') : 'nothing timed';
+
+  /* histogram */
+  const E=C.latEdges, W=560, H=176, PL=34, PB=30, max=Math.max(...counts,1);
+  let s=`<svg viewBox="0 0 ${W} ${H+PB}" role="img" aria-label="Latency distribution">`;
+  const bw=(W-PL-6)/counts.length;
+  const p50=histPctl(counts,.5), p95=histPctl(counts,.95);
+  for(let i=0;i<counts.length;i++){
+    const h=(H-14)*counts[i]/max, x=PL+i*bw;
+    s+=`<rect x="${(x+1).toFixed(1)}" y="${(H-h).toFixed(1)}" width="${(bw-2).toFixed(1)}" `+
+       `height="${Math.max(counts[i]?1:0,h).toFixed(1)}" fill="var(${isTool?'--s1':'--s7'})" rx="1.5"/>`;
+    if(i%4===0) s+=`<text class="ax" x="${(x).toFixed(1)}" y="${H+13}" text-anchor="middle">${edgeLbl(E[i])}</text>`;
+  }
+  for(const [v,lbl] of [[p50,'p50'],[p95,'p95']]){
+    if(v==null) continue;
+    let bi=0; while(bi+1<E.length && E[bi+1]<=v) bi++;
+    const frac=(E[bi+1]?(v-E[bi])/(E[bi+1]-E[bi]):0);
+    const x=PL+(bi+Math.min(1,Math.max(0,frac)))*bw;
+    s+=`<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="4" y2="${H}" stroke="var(--critical)" stroke-width="1.5" stroke-dasharray="3 2"/>`;
+    s+=`<text class="dl" x="${(x+4).toFixed(1)}" y="12">${lbl} ${msf(v)}</text>`;
+  }
+  s+=`<line class="bl-axis" x1="${PL}" x2="${W}" y1="${H+.5}" y2="${H+.5}"/>`;
+  s+=`<text class="ax" x="${PL-6}" y="12" text-anchor="end">${fmt(max)}</text>`;
+  s+=`<text class="ax" x="${PL-6}" y="${H+3}" text-anchor="end">0</text></svg>`;
+  const hh=document.getElementById('lat-hist'); hh.innerHTML=s;
+  hh.querySelectorAll('rect').forEach((r,i)=>bindTip(r,
+    `<b>${edgeLbl(E[i])} – ${i+1<E.length?edgeLbl(E[i+1]):'∞'}</b>`+
+    `<div class="r"><i>count</i><b>${fmt(counts[i])}</b></div>`+
+    `<div class="r"><i>share</i><b>${p1(pct(counts[i],tot))}</b></div>`));
+
+  document.getElementById('lat-stats').innerHTML=
+    [['p50',.5],['p90',.9],['p95',.95],['p99',.99]].map(([k,q])=>{
+      const v=histPctl(counts,q);
+      return '<div class="latstat'+(q>=.95?' hi':'')+'"><span class="k">'+k+
+        '</span><span class="v">'+msf(v)+'</span></div>';}).join('')+
+    (isTool?'':'<div class="latstat"><span class="k">out tok/s</span><span class="v">'+
+      (A.turnSecs?(A.turnOut/A.turnSecs).toFixed(1):'—')+'</span></div>'+
+     '<div class="latstat"><span class="k">cache hit</span><span class="v">'+
+      p1(pct(A.cacheRead,A.cacheRead+A.cacheFresh))+'</span></div>');
+
+  /* per-tool / per-model p50 -> p95, log axis */
+  const rows=[];
+  if(isTool){
+    C.tools.forEach((t,i)=>{ const c=A.LTby[i], n=c.reduce((a,b)=>a+b,0);
+      if(n>=5) rows.push({label:t.n,n,p50:histPctl(c,.5),p95:histPctl(c,.95),
+                          color:'var('+CATCOL[catOf(t.c)]+')'}); });
+  } else {
+    (C.models||[]).forEach((m,i)=>{ const c=A.LMby[i], n=c.reduce((a,b)=>a+b,0);
+      if(n>=5) rows.push({label:m,n,p50:histPctl(c,.5),p95:histPctl(c,.95),
+                          color:'var(--s7)'}); });
+  }
+  rows.sort((a,b)=>b.p50-a.p50);
+  drawLatRanges(rows.slice(0,14));
+}
+
+const TICKS=[[1,'1ms'],[10,'10ms'],[100,'100ms'],[1000,'1s'],[10000,'10s'],
+             [60000,'1min'],[600000,'10min'],[3600000,'1h']];
+function drawLatRanges(rows){
+  const host=document.getElementById('lat-bars');
+  if(!rows.length){ host.innerHTML='<div class="empty">Nothing timed in this selection.</div>'; return; }
+  const LO=1, HI=Math.max(...rows.map(r=>r.p95||1),1000);
+  const l10=Math.log10, span=l10(HI)-l10(LO)||1;
+  const W=700, GUT=132, RH=23, PB=22, H=rows.length*RH+PB;
+  const x=v=>GUT+(W-GUT-56)*(l10(Math.max(v||LO,LO))-l10(LO))/span;
+  let s=`<svg viewBox="0 0 ${W} ${H+8}" role="img" aria-label="Median to 95th percentile latency by tool, log scale">`;
+  for(const [v,lbl] of TICKS){
+    if(v>HI*1.05) continue;
+    s+=`<line class="gl" x1="${x(v).toFixed(1)}" x2="${x(v).toFixed(1)}" y1="0" y2="${rows.length*RH}"/>`;
+    s+=`<text class="ax" x="${x(v).toFixed(1)}" y="${rows.length*RH+13}" text-anchor="middle">${lbl}</text>`;
+  }
+  rows.forEach((r,i)=>{
+    const y=i*RH+RH/2, a=x(r.p50), b=x(r.p95);
+    s+=`<text class="ax" x="${GUT-9}" y="${y+3.5}" text-anchor="end" style="font-size:11px;fill:var(--ink-2)">${esc(r.label).slice(0,20)}</text>`;
+    s+=`<line x1="${a.toFixed(1)}" x2="${Math.max(b,a+2).toFixed(1)}" y1="${y}" y2="${y}" stroke="var(--axis)" stroke-width="2" stroke-linecap="round"/>`;
+    s+=`<circle cx="${Math.max(b,a+2).toFixed(1)}" cy="${y}" r="3" fill="var(--axis)"/>`;
+    s+=`<circle cx="${a.toFixed(1)}" cy="${y}" r="4.5" fill="${r.color}" stroke="var(--surface)" stroke-width="2"/>`;
+    s+=`<text class="ax" x="${W-50}" y="${y+3.5}" style="font-size:10.5px;fill:var(--ink)">${msf(r.p50)}</text>`;
+  });
+  s+='</svg>';
+  host.innerHTML=s;
+  host.querySelectorAll('circle').forEach((c,i)=>{
+    const r=rows[Math.floor(i/2)]; if(!r) return;
+    bindTip(c,'<b>'+esc(r.label)+'</b><div class="r"><i>timed</i><b>'+fmt(r.n)+'</b></div>'+
+      '<div class="r"><i>p50</i><b>'+msf(r.p50)+'</b></div>'+
+      '<div class="r"><i>p95</i><b>'+msf(r.p95)+'</b></div>');
+  });
+}
+document.querySelector('.lat-switch').addEventListener('click',e=>{
+  const b=e.target.closest('[data-lat]'); if(!b) return;
+  latMode=b.dataset.lat;
+  document.querySelectorAll('[data-lat]').forEach(x=>
+    x.setAttribute('aria-pressed', x===b?'true':'false'));
+  render();
+});
+
 /* ---- render ---- */
 function render(){
   const A=agg();
@@ -1368,6 +1726,8 @@ function render(){
     '<span class="lgi"><span class="sw" style="background:var(--s1)"></span>Search results <b>'+fmt(ws)+'</b></span>'+
     '<span class="lgi"><span class="sw" style="background:var(--s2)"></span>Pages fetched <b>'+fmt(wf)+'</b></span>';
   document.getElementById('web-meta').textContent=wr.length?wr.length+' domains shown':'no web activity';
+
+  drawLatency(A);
 
   /* hours + exts */
   drawHours(A);
@@ -1491,7 +1851,7 @@ def _table(headers, rows, aligns=None, indent="  "):
     return "\n".join(out) + "\n"
 
 
-def write_report(calls, urls, cube, git_counter, path):
+def write_report(calls, urls, turns, cube, git_counter, path):
     live = [r for r in calls if r.get("date")]
     n = len(live)
     pc = lambda a, b: "%.2f%%" % (100.0 * a / b) if b else "—"
@@ -1581,6 +1941,133 @@ payload           : {bi} in / {bo} out
             o.append(_table(["command", "calls using", "of which errored", "rate"], rows))
     else:
         o.append("  no errors recorded\n")
+
+    section("LATENCY")
+    o.append("""  Two clocks, measured separately:
+    tool latency  tool_use emitted -> tool_result recorded. Includes the command
+                  itself plus, when a call needed approval, however long you took
+                  to grant it. Percentiles are robust to that; the mean is not.
+    turn latency  triggering tool_result -> last block of the model's reply, for
+                  inferences the harness started on its own. Turns triggered by a
+                  typed prompt are excluded: that gap contains your typing.
+""")
+    tool_lat = defaultdict(list)
+    for r in live:
+        if r["duration_ms"] is not None:
+            tool_lat[r["tool_name"]].append(r["duration_ms"])
+    allv = sorted(v for vals in tool_lat.values() for v in vals)
+    if allv:
+        o.append("  all tool calls (%s timed): p50 %s · p90 %s · p95 %s · p99 %s · max %s\n"
+                 % (fmt_int(len(allv)), ms(pctl(allv, .50)), ms(pctl(allv, .90)),
+                    ms(pctl(allv, .95)), ms(pctl(allv, .99)), ms(allv[-1])))
+        rows = []
+        for t, vals in sorted(tool_lat.items(), key=lambda x: -pctl(sorted(x[1]), .5)):
+            v = sorted(vals)
+            if len(v) < 5:
+                continue
+            rows.append([t, fmt_int(len(v)), ms(pctl(v, .5)), ms(pctl(v, .9)),
+                         ms(pctl(v, .95)), ms(v[-1]),
+                         ms(sum(v) / len(v))])
+        o.append("\n  by tool, slowest median first (>=5 timed calls)\n")
+        o.append(_table(["tool", "n", "p50", "p90", "p95", "max", "mean"], rows))
+
+        cat_lat = defaultdict(list)
+        for r in live:
+            if r["duration_ms"] is not None:
+                cat_lat[r["tool_category"]].append(r["duration_ms"])
+        o.append("\n  by category\n")
+        o.append(_table(["category", "n", "p50", "p90", "p95"],
+                        [[c, fmt_int(len(v)), ms(pctl(sorted(v), .5)),
+                          ms(pctl(sorted(v), .9)), ms(pctl(sorted(v), .95))]
+                         for c, v in sorted(cat_lat.items(),
+                                            key=lambda x: -pctl(sorted(x[1]), .5))]))
+
+        bash_lat = defaultdict(list)
+        for r in live:
+            if r["tool_name"] == "Bash" and r["duration_ms"] is not None:
+                for b in r["bash_bins"] or []:
+                    bash_lat[b].append(r["duration_ms"])
+        rows = [[b, fmt_int(len(v)), ms(pctl(sorted(v), .5)), ms(pctl(sorted(v), .9)),
+                 ms(max(v))]
+                for b, v in sorted(bash_lat.items(), key=lambda x: -pctl(sorted(x[1]), .5))
+                if len(v) >= 20][:15]
+        if rows:
+            o.append("\n  Bash calls containing each command, slowest median first (>=20 calls)\n")
+            o.append(_table(["command", "calls", "p50", "p90", "max"], rows))
+
+        plabels = shorten_projects(sorted({r["project"] for r in live}))
+        slow = sorted((r for r in live if r["duration_ms"] is not None),
+                      key=lambda r: -r["duration_ms"])[:10]
+        o.append("\n  slowest individual calls\n")
+        o.append(_table(["tool", "duration", "project", "when"],
+                        [[r["tool_name"], ms(r["duration_ms"]),
+                          plabels[r["project"]][:28],
+                          (r["ts"] or "")[:16].replace("T", " ")] for r in slow]))
+    else:
+        o.append("  no timed tool calls\n")
+
+    idle_turns = [t for t in turns if t.get("idle")]
+    timed = [t for t in turns if t.get("latency_ms") is not None
+             and t.get("trigger_kind") == "tool_result" and not t.get("idle")]
+    if timed:
+        lv = sorted(t["latency_ms"] for t in timed)
+        o.append("\n  model turn latency (%s of %s turns machine-triggered; %s excluded as "
+                 "idle, i.e. the trigger sat more than %s in the past because the session was "
+                 "paused, interrupted or resumed)\n"
+                 % (fmt_int(len(timed)), fmt_int(len(turns)), fmt_int(len(idle_turns)),
+                    ms(IDLE_CUTOFF_MS)))
+        rows = []
+        by_model = defaultdict(list)
+        for t in timed:
+            by_model[t.get("model") or "?"].append(t)
+        for mdl, ts_ in sorted(by_model.items(), key=lambda x: -len(x[1])):
+            v = sorted(t["latency_ms"] for t in ts_)
+            out = sum(t["output_tokens"] for t in ts_)
+            secs = sum(t["latency_ms"] for t in ts_) / 1000.0
+            med_out = pctl(sorted(t["output_tokens"] for t in ts_), .5)
+            rows.append([mdl, fmt_int(len(v)), ms(pctl(v, .5)), ms(pctl(v, .9)),
+                         ms(pctl(v, .95)), ms(v[-1]), fmt_int(med_out or 0),
+                         "%.1f" % (out / secs) if secs else "—"])
+        o.append(_table(["model", "turns", "p50", "p90", "p95", "max",
+                         "med out tok", "out tok/s"], rows))
+        o.append("  out tok/s is end to end (queue + prefill + decode), so a model used for "
+                 "many small turns\n  reads slower than one used for long ones - read it "
+                 "next to the median output size.\n")
+
+        tot_out = sum(t["output_tokens"] for t in turns)
+        tot_in = sum(t["input_tokens"] for t in turns)
+        tot_cr = sum(t["cache_read_tokens"] for t in turns)
+        tot_cc = sum(t["cache_creation_tokens"] for t in turns)
+        billed = tot_in + tot_cc
+        o.append("\n  tokens: %s output · %s fresh input · %s cache read · %s cache write\n"
+                 "  cache hit ratio: %.1f%% of context tokens came from cache\n"
+                 % (fmt_int(tot_out), fmt_int(tot_in), fmt_int(tot_cr), fmt_int(tot_cc),
+                    100.0 * tot_cr / (tot_cr + billed) if (tot_cr + billed) else 0))
+
+        with_think = [t["latency_ms"] for t in timed if t.get("thinking")]
+        without = [t["latency_ms"] for t in timed if not t.get("thinking")]
+        if with_think and without:
+            o.append("  extended thinking: p50 %s over %s turns vs %s over %s without\n"
+                     % (ms(pctl(sorted(with_think), .5)), fmt_int(len(with_think)),
+                        ms(pctl(sorted(without), .5)), fmt_int(len(without))))
+
+        # Machine time only: human-facing tools are a wait on you, not on a
+        # machine, and idle turns are not inference at all.
+        tool_ms = sum(r["duration_ms"] for r in live
+                      if r["duration_ms"] is not None
+                      and r["tool_category"] != "user_io"
+                      and r["duration_ms"] <= IDLE_CUTOFF_MS)
+        human_ms = sum(r["duration_ms"] for r in live
+                       if r["duration_ms"] is not None and r["tool_category"] == "user_io")
+        model_ms = sum(t["latency_ms"] for t in timed)
+        both = tool_ms + model_ms
+        if both:
+            o.append("\n  where the machine time goes: %.0f%% waiting on tools, "
+                     "%.0f%% waiting on the model\n"
+                     "  (%s of tool time, %s of model time; excludes %s of human-facing "
+                     "waits and any single wait over %s)\n"
+                     % (100.0 * tool_ms / both, 100.0 * model_ms / both,
+                        ms(tool_ms), ms(model_ms), ms(human_ms), ms(IDLE_CUTOFF_MS)))
 
     section("WEB")
     if urls:
@@ -1686,6 +2173,13 @@ CALL_COLUMNS = [
 ]
 URL_COLUMNS = ["source", "url", "domain", "title", "query", "project",
                "session_id", "ts", "date", "tool_use_id"]
+TURN_COLUMNS = [
+    "request_id", "session_id", "project", "transcript", "model", "ts", "date", "hour",
+    "trigger_kind", "latency_ms", "ttfb_ms", "decode_ms", "output_tps",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+    "cache_hit_ratio", "stop_reason", "service_tier", "speed",
+    "is_sidechain", "entrypoint", "blocks", "tool_uses", "thinking", "idle",
+]
 
 
 def main(argv=None):
@@ -1720,26 +2214,25 @@ def main(argv=None):
         return 2
     say("Reading %s transcripts from %s" % (fmt_int(len(files)), root))
 
-    calls, urls = [], []
+    calls, urls, turns = [], [], []
     payload = [(f, root) for f in files]
+
+    def collect(results):
+        for c, u, t in results:
+            calls.extend(c)
+            urls.extend(u)
+            turns.extend(t)
+
     if a.jobs > 1 and len(files) > 4:
         try:
             with ProcessPoolExecutor(max_workers=a.jobs) as ex:
-                for c, u in ex.map(parse_transcript, payload, chunksize=8):
-                    calls.extend(c)
-                    urls.extend(u)
+                collect(ex.map(parse_transcript, payload, chunksize=8))
         except Exception as e:                       # sandboxes without fork/sem support
             say("  parallel parse unavailable (%s); falling back to one process" % e)
-            calls, urls = [], []
-            for item in payload:
-                c, u = parse_transcript(item)
-                calls.extend(c)
-                urls.extend(u)
+            calls, urls, turns = [], [], []
+            collect(parse_transcript(i) for i in payload)
     else:
-        for item in payload:
-            c, u = parse_transcript(item)
-            calls.extend(c)
-            urls.extend(u)
+        collect(parse_transcript(i) for i in payload)
 
     # A resumed or forked session replays earlier turns into a new transcript.
     # tool_use ids are unique per API call, so keep the first and drop the copies.
@@ -1764,17 +2257,32 @@ def main(argv=None):
         useen.add(k)
         udd.append(u)
     urls = udd
-    say("  %s tool calls (%s replayed copies dropped) · %s url rows"
-        % (fmt_int(len(calls)), fmt_int(dupes), fmt_int(len(urls))))
+    turns.sort(key=lambda t: t.get("ts") or "")
+    tseen, tdd, tdupes = set(), [], 0
+    for t in turns:
+        k = t["request_id"]
+        if k and k in tseen:
+            tdupes += 1
+            continue
+        if k:
+            tseen.add(k)
+        tdd.append(t)
+    turns = tdd
+    say("  %s tool calls (%s replayed copies dropped) · %s url rows · %s model turns (%s dropped)"
+        % (fmt_int(len(calls)), fmt_int(dupes), fmt_int(len(urls)),
+           fmt_int(len(turns)), fmt_int(tdupes)))
 
     if a.since or a.until:
         for r in calls:
             r["date"], r["hour"] = local_parts(r["ts"])
         for u in urls:
             u["date"], _ = local_parts(u["ts"])
+        for t in turns:
+            t["date"], t["hour"] = local_parts(t["ts"])
         lo, hi = a.since or "0000-00-00", a.until or "9999-99-99"
         calls = [r for r in calls if r["date"] and lo <= r["date"] <= hi]
         urls = [u for u in urls if u["date"] and lo <= u["date"] <= hi]
+        turns = [t for t in turns if t["date"] and lo <= t["date"] <= hi]
         say("  %s calls in %s..%s" % (fmt_int(len(calls)), lo, hi))
 
     if not calls:
@@ -1788,11 +2296,11 @@ def main(argv=None):
                 git[m.group(1)] += 1
 
     if a.redact:
-        calls, urls = redact_rows(calls, urls)
+        calls, urls, turns = redact_rows(calls, urls, turns)
         say("  redacted: paths, commands, queries, URLs and project names removed")
 
     os.makedirs(a.out, exist_ok=True)
-    cube = build_cube(calls, urls, git, redacted=a.redact)
+    cube = build_cube(calls, urls, turns, git, redacted=a.redact)
     written = []
 
     if not a.no_tables:
@@ -1800,9 +2308,12 @@ def main(argv=None):
                                    CALL_COLUMNS, want_parquet=not a.csv))
         written.append(write_table(urls, os.path.join(a.out, "web_urls"),
                                    URL_COLUMNS, want_parquet=not a.csv))
+        if turns:
+            written.append(write_table(turns, os.path.join(a.out, "model_turns"),
+                                       TURN_COLUMNS, want_parquet=not a.csv))
 
     report_path = os.path.join(a.out, "report.txt")
-    text = write_report(calls, urls, cube, git, report_path)
+    text = write_report(calls, urls, turns, cube, git, report_path)
     written.append(report_path)
 
     dash = None

@@ -23,6 +23,10 @@ python3 cc_toolstat.py --open
   before tokenising, so an embedded Python script isn't counted as 40 shell commands.
 - **Where do my web calls go** — which domains searches surface versus which pages actually
   get fetched.
+- **How long does everything take?** Two clocks, measured separately: *tool latency* (call
+  issued → result landed) and *model turn latency* (triggering result → last block of the
+  reply). Percentiles, not means, plus end-to-end output tokens/sec, cache hit ratio, and
+  where your machine time actually goes.
 - Plus: hour-of-day rhythm, file types touched, git subcommand mix, per-project breakdown,
   main-thread versus subagent share, model and entrypoint mix.
 
@@ -32,6 +36,7 @@ python3 cc_toolstat.py --open
 |---|---|
 | `tool_calls.parquet` | one row per tool call, 38 columns — the fact table |
 | `web_urls.parquet` | one row per URL searched or fetched |
+| `model_turns.parquet` | one row per inference: latency, tokens, cache hit, stop reason |
 | `dashboard.html` | self-contained interactive dashboard, filterable by project and date |
 | `report.txt` | the same analysis as plain text |
 
@@ -96,6 +101,39 @@ Error text is matched against an ordered rule list into ~22 kinds, grouped into
 `blocked_by_policy`, `hook_infra`, `command_failed`, `agent_mistake` and `infra_limit`.
 On the corpus this was developed against, 99.9% of error text classified.
 
+## Latency, and why the numbers are what they are
+
+Two clocks, and they are not the same thing.
+
+**Tool latency** is `tool_use` emitted → `tool_result` recorded. It contains the work
+itself *and*, when a call needed your approval, however long you took to grant it. That is
+why the report leads with percentiles: a single 19-hour `AskUserQuestion` moves a mean and
+does nothing to a p50.
+
+**Model turn latency** is the triggering `tool_result` → the last content block of the
+reply: queue, prefill and decode together. Getting this right needs two corrections that
+are easy to miss:
+
+- One API call is written to the transcript as *several lines*, one per content block
+  (thinking, text, then each `tool_use`), all repeating the same `usage` totals. Treating
+  each line as an inference triple-counts turns and badly understates latency. Turns are
+  grouped by `requestId`.
+- Turns you started by typing are excluded — that gap contains your thinking time, not the
+  model's. Only machine-triggered turns count.
+- A machine-triggered turn that appears to take hours means the session was paused,
+  interrupted or resumed with the wall clock still running. Anything over 10 minutes is
+  flagged `idle` and kept out of the statistics; the count is reported. On the development
+  corpus this was 226 of 38,498 turns, and removing them moved end-to-end throughput for
+  one model from 6.6 to 25.5 output tokens/sec.
+
+`out tok/s` is end-to-end, so it includes queue and prefill. A model used for many small
+turns reads slower than one used for long ones — the report prints median output tokens per
+turn beside it so the comparison is interpretable.
+
+The dashboard recomputes percentiles under your filters from a log-bucketed histogram
+(~1.6× steps), so its figures interpolate within a bucket and land within a few percent of
+the exact ones. `report.txt` computes exact percentiles from the raw rows.
+
 ## Caveats
 
 - `duration_ms` is request → result wall clock. For `AskUserQuestion` that measures how long
@@ -104,6 +142,10 @@ On the corpus this was developed against, 99.9% of error text classified.
 - Git subcommands are counted by regex across the whole corpus and don't respond to the
   dashboard filters.
 - Dates and hours use your machine's local timezone; transcript timestamps are UTC.
+- Tool latency includes permission-prompt waits and cannot be separated from them; read the
+  percentiles, not the mean.
+- The "where the machine time goes" split excludes human-facing tools and any single wait
+  over the idle cutoff, so it measures machine time rather than elapsed session time.
 
 ## Development
 
